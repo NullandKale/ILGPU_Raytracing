@@ -1,4 +1,8 @@
-﻿// File: Engine/BvhManager.cs
+﻿
+// ==============================
+// File: Engine/BvhManager.cs
+// Minimal change: forward extended views (signature expanded)
+// ==============================
 using System;
 using ILGPU;
 using ILGPU.Runtime;
@@ -18,36 +22,13 @@ namespace ILGPU_Raytracing.Engine
         private readonly CudaAccelerator _cuda;
         private Scene _scene;
 
-        public BvhManager(CudaAccelerator cuda, Scene scene)
-        {
-            _cuda = cuda ?? throw new ArgumentNullException(nameof(cuda));
-            _scene = scene ?? throw new ArgumentNullException(nameof(scene));
-        }
+        public BvhManager(CudaAccelerator cuda, Scene scene) { _cuda = cuda ?? throw new ArgumentNullException(nameof(cuda)); _scene = scene ?? throw new ArgumentNullException(nameof(scene)); }
+        public void AttachScene(Scene scene) { _scene = scene ?? throw new ArgumentNullException(nameof(scene)); }
+        public void BuildOrRefit(Scene scene, RebuildPolicy policy) { if (scene == null) { throw new ArgumentNullException(nameof(scene)); } _scene = scene; scene.UploadAll(); }
 
-        public void AttachScene(Scene scene)
+        public void GetDeviceViews(out ArrayView<TLASNode> tlasNodes, out ArrayView<int> tlasInstanceIndices, out ArrayView<InstanceRecord> instances, out ArrayView<BLASNode> blasNodes, out ArrayView<int> spherePrimIndices, out ArrayView<Sphere> spheres, out ArrayView<int> triPrimIndices, out ArrayView<Float3> meshPositions, out ArrayView<MeshTri> meshTris, out ArrayView<Float2> meshTexcoords, out ArrayView<MeshTriUV> meshTriUVs, out ArrayView<int> triMatIndex, out ArrayView<MaterialRecord> materials, out ArrayView<RGBA32> texels, out ArrayView<TexInfo> texInfos)
         {
-            _scene = scene ?? throw new ArgumentNullException(nameof(scene));
-        }
-
-        public void BuildOrRefit(Scene scene, RebuildPolicy policy)
-        {
-            if (scene == null)
-            {
-                throw new ArgumentNullException(nameof(scene));
-            }
-            _scene = scene;
-            // For now, delegate to the scene's existing upload/build path; this preserves behavior and keeps the renderer/kernel untouched.
-            // Policy hooks are reserved for future fine-grained refit vs rebuild once the low-level BLAS/TLAS builders are migrated here.
-            scene.UploadAll();
-        }
-
-        public void GetDeviceViews(out ArrayView<TLASNode> tlasNodes, out ArrayView<int> tlasInstanceIndices, out ArrayView<InstanceRecord> instances, out ArrayView<BLASNode> blasNodes, out ArrayView<int> spherePrimIndices, out ArrayView<Sphere> spheres, out ArrayView<int> triPrimIndices, out ArrayView<Float3> meshPositions, out ArrayView<MeshTri> meshTris)
-        {
-            if (_scene == null)
-            {
-                throw new InvalidOperationException("No attached scene.");
-            }
-            // Forward the exact views that the renderer/kernel already consume.
+            if (_scene == null) { throw new InvalidOperationException("No attached scene."); }
             tlasNodes = _scene.TLASNodesView;
             tlasInstanceIndices = _scene.TLASInstanceIndicesView;
             instances = _scene.InstancesView;
@@ -57,12 +38,14 @@ namespace ILGPU_Raytracing.Engine
             triPrimIndices = _scene.TriPrimIndicesView;
             meshPositions = _scene.MeshPositionsView;
             meshTris = _scene.MeshTrisView;
+            meshTexcoords = _scene.MeshTexcoordsView;
+            meshTriUVs = _scene.MeshTriUVsView;
+            triMatIndex = _scene.TriMaterialIndexView;
+            materials = _scene.MaterialsView;
+            texels = _scene.TexelsView;
+            texInfos = _scene.TexInfosView;
         }
 
-        public void Dispose()
-        {
-            // This manager does not own ILGPU buffers yet; disposal is handled by Scene.
-            // When BVH builders and buffers move here, add disposal logic accordingly.
-        }
+        public void Dispose() { }
     }
 }

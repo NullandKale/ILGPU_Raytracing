@@ -1,9 +1,15 @@
-﻿// File: Engine/Scene.cs
+﻿
+// ==============================
+// File: Engine/Scene.cs
+// Replaces your existing Scene.cs (adds UVs/materials/textures pipeline and uploads)
+// ==============================
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Runtime.CompilerServices;
 using ILGPU;
+using ILGPU.Algorithms;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
 
@@ -26,6 +32,14 @@ namespace ILGPU_Raytracing.Engine
         private readonly List<Float3> _hMeshPositions = new List<Float3>();
         private readonly List<MeshTri> _hMeshTris = new List<MeshTri>();
 
+        // New: UVs, per-tri UV indices, per-tri material index, materials, textures
+        private readonly List<Float2> _hMeshTexcoords = new List<Float2>();
+        private readonly List<MeshTriUV> _hMeshTriUVs = new List<MeshTriUV>();
+        private readonly List<int> _hTriMaterialIndex = new List<int>();
+        private readonly List<MaterialRecord> _hMaterials = new List<MaterialRecord>();
+        private readonly List<TexInfo> _hTexInfos = new List<TexInfo>();
+        private readonly List<RGBA32> _hTexels = new List<RGBA32>();
+
         private MemoryBuffer1D<TLASNode, Stride1D.Dense> _dTLASNodes;
         private MemoryBuffer1D<int, Stride1D.Dense> _dTLASInstanceIndices;
         private MemoryBuffer1D<InstanceRecord, Stride1D.Dense> _dInstances;
@@ -39,83 +53,37 @@ namespace ILGPU_Raytracing.Engine
         private MemoryBuffer1D<Float3, Stride1D.Dense> _dMeshPositions;
         private MemoryBuffer1D<MeshTri, Stride1D.Dense> _dMeshTris;
 
+        // New device buffers
+        private MemoryBuffer1D<Float2, Stride1D.Dense> _dMeshTexcoords;
+        private MemoryBuffer1D<MeshTriUV, Stride1D.Dense> _dMeshTriUVs;
+        private MemoryBuffer1D<int, Stride1D.Dense> _dTriMaterialIndex;
+        private MemoryBuffer1D<MaterialRecord, Stride1D.Dense> _dMaterials;
+        private MemoryBuffer1D<RGBA32, Stride1D.Dense> _dTexels;
+        private MemoryBuffer1D<TexInfo, Stride1D.Dense> _dTexInfos;
+
         public Scene(CudaAccelerator cuda)
         {
             _cuda = cuda ?? throw new ArgumentNullException(nameof(cuda));
             UploadAll();
         }
 
-        public ArrayView<TLASNode> TLASNodesView
-        {
-            get
-            {
-                return _dTLASNodes.View;
-            }
-        }
+        public ArrayView<TLASNode> TLASNodesView { get { return _dTLASNodes.View; } }
+        public ArrayView<int> TLASInstanceIndicesView { get { return _dTLASInstanceIndices.View; } }
+        public ArrayView<InstanceRecord> InstancesView { get { return _dInstances.View; } }
+        public ArrayView<BLASNode> BLASNodesView { get { return _dBLASNodes.View; } }
+        public ArrayView<int> SpherePrimIndicesView { get { return _dSpherePrimIndices.View; } }
+        public ArrayView<Sphere> SpheresView { get { return _dSpheres.View; } }
+        public ArrayView<int> TriPrimIndicesView { get { return _dTriPrimIndices.View; } }
+        public ArrayView<Float3> MeshPositionsView { get { return _dMeshPositions.View; } }
+        public ArrayView<MeshTri> MeshTrisView { get { return _dMeshTris.View; } }
 
-        public ArrayView<int> TLASInstanceIndicesView
-        {
-            get
-            {
-                return _dTLASInstanceIndices.View;
-            }
-        }
-
-        public ArrayView<InstanceRecord> InstancesView
-        {
-            get
-            {
-                return _dInstances.View;
-            }
-        }
-
-        public ArrayView<BLASNode> BLASNodesView
-        {
-            get
-            {
-                return _dBLASNodes.View;
-            }
-        }
-
-        public ArrayView<int> SpherePrimIndicesView
-        {
-            get
-            {
-                return _dSpherePrimIndices.View;
-            }
-        }
-
-        public ArrayView<Sphere> SpheresView
-        {
-            get
-            {
-                return _dSpheres.View;
-            }
-        }
-
-        public ArrayView<int> TriPrimIndicesView
-        {
-            get
-            {
-                return _dTriPrimIndices.View;
-            }
-        }
-
-        public ArrayView<Float3> MeshPositionsView
-        {
-            get
-            {
-                return _dMeshPositions.View;
-            }
-        }
-
-        public ArrayView<MeshTri> MeshTrisView
-        {
-            get
-            {
-                return _dMeshTris.View;
-            }
-        }
+        // New public views
+        public ArrayView<Float2> MeshTexcoordsView { get { return _dMeshTexcoords.View; } }
+        public ArrayView<MeshTriUV> MeshTriUVsView { get { return _dMeshTriUVs.View; } }
+        public ArrayView<int> TriMaterialIndexView { get { return _dTriMaterialIndex.View; } }
+        public ArrayView<MaterialRecord> MaterialsView { get { return _dMaterials.View; } }
+        public ArrayView<RGBA32> TexelsView { get { return _dTexels.View; } }
+        public ArrayView<TexInfo> TexInfosView { get { return _dTexInfos.View; } }
 
         public void BuildDefaultScene()
         {
@@ -125,6 +93,12 @@ namespace ILGPU_Raytracing.Engine
             _hTriPrimIndices.Clear();
             _hMeshPositions.Clear();
             _hMeshTris.Clear();
+            _hMeshTexcoords.Clear();
+            _hMeshTriUVs.Clear();
+            _hTriMaterialIndex.Clear();
+            _hMaterials.Clear();
+            _hTexInfos.Clear();
+            _hTexels.Clear();
 
             int ground = AddSphere(new Sphere { center = new Float3(0f, -1000.5f, 0f), radius = 1000f, albedo = new Float3(0.8f, 0.8f, 0.8f) });
             int s0 = AddSphere(new Sphere { center = new Float3(-0.9f, 0.5f, -0.2f), radius = 0.5f, albedo = new Float3(0.8f, 0.3f, 0.3f) });
@@ -155,8 +129,12 @@ namespace ILGPU_Raytracing.Engine
 
             int baseVertex = _hMeshPositions.Count;
             int baseTri = _hMeshTris.Count;
+            int baseUV = _hMeshTexcoords.Count;
+            int baseMat = _hMaterials.Count;
+            int triCountBefore = _hTriPrimIndices.Count;
 
             _hMeshPositions.AddRange(mesh.Positions);
+            _hMeshTexcoords.AddRange(mesh.Texcoords);
             for (int i = 0; i < mesh.Triangles.Count; i++)
             {
                 MeshTri t = mesh.Triangles[i];
@@ -164,8 +142,51 @@ namespace ILGPU_Raytracing.Engine
                 t.i1 += baseVertex;
                 t.i2 += baseVertex;
                 _hMeshTris.Add(t);
+
+                var tuv = mesh.TriUVs[i];
+                tuv.t0 += baseUV;
+                tuv.t1 += baseUV;
+                tuv.t2 += baseUV;
+                _hMeshTriUVs.Add(tuv);
+
+                int matIndexLocal = (i < mesh.TriMaterialIndex.Count) ? mesh.TriMaterialIndex[i] : 0;
+                int matIndexGlobal = baseMat + matIndexLocal;
+                _hTriMaterialIndex.Add(matIndexGlobal);
+
                 _hTriPrimIndices.Add(baseTri + i);
             }
+
+            // Append materials, remapping each material's texture index to a flattened texel array
+            // We store each texture serially and emit TexInfo with offset/size for sampling
+            int texBase = _hTexels.Count;
+            int curOffset = texBase;
+            var localMatCount = mesh.Materials.Count;
+            var matRemapped = new List<MaterialRecord>(localMatCount);
+            for (int i = 0; i < localMatCount; i++)
+            {
+                var m = mesh.Materials[i];
+                if (m.HasDiffuseMap != 0 && m.DiffuseTexIndex >= 0 && m.DiffuseTexIndex < mesh.Textures.Count)
+                {
+                    var src = mesh.Textures[m.DiffuseTexIndex];
+                    int w = src.Width;
+                    int h = src.Height;
+                    int start = _hTexels.Count;
+                    for (int p = 0; p < src.BGRA.Length; p += 4)
+                    {
+                        _hTexels.Add(new RGBA32 { B = src.BGRA[p + 0], G = src.BGRA[p + 1], R = src.BGRA[p + 2], A = src.BGRA[p + 3] });
+                    }
+                    int texIndexGlobal = _hTexInfos.Count;
+                    _hTexInfos.Add(new TexInfo { Offset = start, Width = w, Height = h });
+                    m.DiffuseTexIndex = texIndexGlobal;
+                }
+                else
+                {
+                    m.HasDiffuseMap = 0;
+                    m.DiffuseTexIndex = -1;
+                }
+                matRemapped.Add(m);
+            }
+            _hMaterials.AddRange(matRemapped);
 
             MeshGlobal.SetTris(_hMeshTris);
 
@@ -174,7 +195,7 @@ namespace ILGPU_Raytracing.Engine
             int blasCount = _hBLASNodes.Count - blasStart;
 
             Float3 bmin; Float3 bmax;
-            ComputeMeshBounds(mesh, out bmin, out bmax);
+            ComputeMeshBounds(mesh.Positions, mesh.Triangles, out bmin, out bmax);
 
             Float3 wmin; Float3 wmax;
             TransformAABB(objectToWorld, bmin, bmax, out wmin, out wmax);
@@ -214,9 +235,16 @@ namespace ILGPU_Raytracing.Engine
             _dTriPrimIndices.DisposeIfValid(); _dTriPrimIndices = AllocateOrEmpty((_hTriPrimIndices != null ? _hTriPrimIndices.ToArray() : Array.Empty<int>()));
             _dMeshPositions.DisposeIfValid(); _dMeshPositions = AllocateOrEmpty((_hMeshPositions != null ? _hMeshPositions.ToArray() : Array.Empty<Float3>()));
             _dMeshTris.DisposeIfValid(); _dMeshTris = AllocateOrEmpty((_hMeshTris != null ? _hMeshTris.ToArray() : Array.Empty<MeshTri>()));
+
+            _dMeshTexcoords.DisposeIfValid(); _dMeshTexcoords = AllocateOrEmpty((_hMeshTexcoords != null ? _hMeshTexcoords.ToArray() : Array.Empty<Float2>()));
+            _dMeshTriUVs.DisposeIfValid(); _dMeshTriUVs = AllocateOrEmpty((_hMeshTriUVs != null ? _hMeshTriUVs.ToArray() : Array.Empty<MeshTriUV>()));
+            _dTriMaterialIndex.DisposeIfValid(); _dTriMaterialIndex = AllocateOrEmpty((_hTriMaterialIndex != null ? _hTriMaterialIndex.ToArray() : Array.Empty<int>()));
+            _dMaterials.DisposeIfValid(); _dMaterials = AllocateOrEmpty((_hMaterials != null ? _hMaterials.ToArray() : Array.Empty<MaterialRecord>()));
+            _dTexels.DisposeIfValid(); _dTexels = AllocateOrEmpty((_hTexels != null ? _hTexels.ToArray() : Array.Empty<RGBA32>()));
+            _dTexInfos.DisposeIfValid(); _dTexInfos = AllocateOrEmpty((_hTexInfos != null ? _hTexInfos.ToArray() : Array.Empty<TexInfo>()));
         }
 
-        public void GetDeviceViews(out ArrayView<TLASNode> tlasNodes, out ArrayView<int> tlasInstanceIndices, out ArrayView<InstanceRecord> instances, out ArrayView<BLASNode> blasNodes, out ArrayView<int> spherePrimIdx, out ArrayView<Sphere> spheres, out ArrayView<int> triPrimIdx, out ArrayView<Float3> meshPositions, out ArrayView<MeshTri> meshTris)
+        public void GetDeviceViews(out ArrayView<TLASNode> tlasNodes, out ArrayView<int> tlasInstanceIndices, out ArrayView<InstanceRecord> instances, out ArrayView<BLASNode> blasNodes, out ArrayView<int> spherePrimIdx, out ArrayView<Sphere> spheres, out ArrayView<int> triPrimIdx, out ArrayView<Float3> meshPositions, out ArrayView<MeshTri> meshTris, out ArrayView<Float2> meshTexcoords, out ArrayView<MeshTriUV> meshTriUVs, out ArrayView<int> triMatIndex, out ArrayView<MaterialRecord> materials, out ArrayView<RGBA32> texels, out ArrayView<TexInfo> texInfos)
         {
             tlasNodes = _dTLASNodes.View;
             tlasInstanceIndices = _dTLASInstanceIndices.View;
@@ -227,6 +255,12 @@ namespace ILGPU_Raytracing.Engine
             triPrimIdx = _dTriPrimIndices.View;
             meshPositions = _dMeshPositions.View;
             meshTris = _dMeshTris.View;
+            meshTexcoords = _dMeshTexcoords.View;
+            meshTriUVs = _dMeshTriUVs.View;
+            triMatIndex = _dTriMaterialIndex.View;
+            materials = _dMaterials.View;
+            texels = _dTexels.View;
+            texInfos = _dTexInfos.View;
         }
 
         private int AddSphere(Sphere s)
@@ -469,12 +503,7 @@ namespace ILGPU_Raytracing.Engine
             private readonly int _axis;
             private readonly List<int> _primIdx;
             private readonly List<Sphere> _spheres;
-            public BLASPrimComparatorSpheres(int axis, List<int> primIdx, List<Sphere> spheres)
-            {
-                _axis = axis;
-                _primIdx = primIdx;
-                _spheres = spheres;
-            }
+            public BLASPrimComparatorSpheres(int axis, List<int> primIdx, List<Sphere> spheres) { _axis = axis; _primIdx = primIdx; _spheres = spheres; }
             public int Compare(int a, int b)
             {
                 int ia = _primIdx[a];
@@ -494,12 +523,7 @@ namespace ILGPU_Raytracing.Engine
             private readonly int _axis;
             private readonly List<int> _primIdx;
             private readonly List<Float3> _positions;
-            public BLASPrimComparatorTris(int axis, List<int> primIdx, List<Float3> positions)
-            {
-                _axis = axis;
-                _primIdx = primIdx;
-                _positions = positions;
-            }
+            public BLASPrimComparatorTris(int axis, List<int> primIdx, List<Float3> positions) { _axis = axis; _primIdx = primIdx; _positions = positions; }
             public int Compare(int a, int b)
             {
                 int ia = _primIdx[a];
@@ -518,11 +542,7 @@ namespace ILGPU_Raytracing.Engine
         {
             private readonly int _axis;
             private readonly InstanceRecord[] _inst;
-            public TLASInstComparator(int axis, InstanceRecord[] inst)
-            {
-                _axis = axis;
-                _inst = inst;
-            }
+            public TLASInstComparator(int axis, InstanceRecord[] inst) { _axis = axis; _inst = inst; }
             public int Compare(int a, int b)
             {
                 Float3 ca = Float3.Center(_inst[a].worldBoundsMin, _inst[a].worldBoundsMax);
@@ -558,15 +578,18 @@ namespace ILGPU_Raytracing.Engine
             outMax = mx;
         }
 
-        private static void ComputeMeshBounds(MeshHost mesh, out Float3 bmin, out Float3 bmax)
+        private static void ComputeMeshBounds(List<Float3> pos, List<MeshTri> tris, out Float3 bmin, out Float3 bmax)
         {
             bmin = new Float3(float.MaxValue, float.MaxValue, float.MaxValue);
             bmax = new Float3(float.MinValue, float.MinValue, float.MinValue);
-            for (int i = 0; i < mesh.Positions.Count; i++)
+            for (int i = 0; i < tris.Count; i++)
             {
-                Float3 p = mesh.Positions[i];
-                bmin = Float3.Min(bmin, p);
-                bmax = Float3.Max(bmax, p);
+                MeshTri t = tris[i];
+                Float3 v0 = pos[t.i0];
+                Float3 v1 = pos[t.i1];
+                Float3 v2 = pos[t.i2];
+                bmin = Float3.Min(bmin, Float3.Min(v0, Float3.Min(v1, v2)));
+                bmax = Float3.Max(bmax, Float3.Max(v0, Float3.Max(v1, v2)));
             }
         }
 
@@ -656,20 +679,20 @@ namespace ILGPU_Raytracing.Engine
             _dTriPrimIndices.DisposeIfValid();
             _dMeshPositions.DisposeIfValid();
             _dMeshTris.DisposeIfValid();
+            _dMeshTexcoords.DisposeIfValid();
+            _dMeshTriUVs.DisposeIfValid();
+            _dTriMaterialIndex.DisposeIfValid();
+            _dMaterials.DisposeIfValid();
+            _dTexels.DisposeIfValid();
+            _dTexInfos.DisposeIfValid();
         }
     }
 
     public static class MeshGlobal
     {
         private static List<MeshTri> _trisRef = new List<MeshTri>();
-        public static void SetTris(List<MeshTri> tris)
-        {
-            _trisRef = tris;
-        }
-        public static MeshTri ResolveTri(int globalTriIndex)
-        {
-            return _trisRef[globalTriIndex];
-        }
+        public static void SetTris(List<MeshTri> tris) { _trisRef = tris; }
+        public static MeshTri ResolveTri(int globalTriIndex) { return _trisRef[globalTriIndex]; }
     }
 
     public enum BlasType
@@ -721,22 +744,24 @@ namespace ILGPU_Raytracing.Engine
         public int i2;
     }
 
+    public struct RGBA32
+    {
+        public byte R;
+        public byte G;
+        public byte B;
+        public byte A;
+    }
+
+    public struct TexInfo
+    {
+        public int Offset;
+        public int Width;
+        public int Height;
+    }
+
     public static class BufferUtils
     {
-        public static void DisposeIfValid(this MemoryBuffer buf)
-        {
-            if (buf != null)
-            {
-                buf.Dispose();
-            }
-        }
-
-        public static void DisposeIfValid<T, TStride>(this MemoryBuffer1D<T, TStride> buf) where T : unmanaged where TStride : struct, IStride1D
-        {
-            if (buf != null && buf.IsValid)
-            {
-                buf.Dispose();
-            }
-        }
+        public static void DisposeIfValid(this MemoryBuffer buf) { if (buf != null) { buf.Dispose(); } }
+        public static void DisposeIfValid<T, TStride>(this MemoryBuffer1D<T, TStride> buf) where T : unmanaged where TStride : struct, IStride1D { if (buf != null && buf.IsValid) { buf.Dispose(); } }
     }
 }
