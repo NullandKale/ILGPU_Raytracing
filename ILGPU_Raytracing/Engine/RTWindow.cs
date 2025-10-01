@@ -1,10 +1,15 @@
-﻿using System;
+﻿
+// ==============================
+// File: Engine/RTWindow.cs
+// ==============================
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel; // CancelEventArgs
 using System.Diagnostics;
 using System.Globalization;
 using System.Threading;
+using System.Threading.Tasks;
 using ILGPU.Runtime.Cuda;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
@@ -43,6 +48,7 @@ namespace ILGPU_Raytracing.Engine
         private bool _mouseCaptured;
         private Vector2 _mousePos;
         private Vector2 _mouseDeltaAccum;
+        private Vector2 _lastMousePos; // polled last position (prevents event backlog)
 
         // ====== Perf stats ======
         private readonly string _baseTitle;
@@ -64,6 +70,9 @@ namespace ILGPU_Raytracing.Engine
         private readonly List<int> _inFlightPbos = new();          // PBOs DMAing to texture (have fences)
         private readonly AutoResetEvent _freeEvent = new(false);
         private readonly AutoResetEvent _readyEvent = new(false);
+
+        // ====== Frame coupling ======
+        private readonly SemaphoreSlim _frameBudget = new(0, 3); // render tickets from GL thread (mailbox: cap backlog)
 
         // ====== Adaptive resolution cap ======
         private const int MaxRayPixels = 2_000_000;
@@ -143,6 +152,7 @@ namespace ILGPU_Raytracing.Engine
             _mouseCaptured = false;
             _mousePos = Vector2.Zero;
             _mouseDeltaAccum = Vector2.Zero;
+            _lastMousePos = MouseState.Position;
 
             _isClosing = false;
             Title = _baseTitle;
@@ -170,6 +180,7 @@ namespace ILGPU_Raytracing.Engine
                 _workerCts?.Cancel();
                 _readyEvent.Set();
                 _freeEvent.Set();
+                _frameBudget.Release(3);
                 _workerThread.Join();
             }
             catch { }
@@ -188,7 +199,15 @@ namespace ILGPU_Raytracing.Engine
 
             while (!ct.IsCancellationRequested)
             {
-                // Pick a free slot (0/1) to render. We don't need the actual PBO index on worker now.
+                try
+                {
+                    if (!_frameBudget.Wait(5, ct)) continue;
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
                 if (!_freePbos.TryDequeue(out int slot))
                 {
                     WaitHandle.WaitAny(new[] { _freeEvent, ct.WaitHandle }, 5);
@@ -221,6 +240,18 @@ namespace ILGPU_Raytracing.Engine
         protected override void OnUpdateFrame(FrameEventArgs args)
         {
             base.OnUpdateFrame(args);
+
+            Vector2 polled = MouseState.Position;
+            Vector2 delta = polled - _lastMousePos;
+            if (!_mouseCaptured) delta = Vector2.Zero;
+            if (delta.X != 0f || delta.Y != 0f)
+            {
+                _mouseDeltaAccum += delta;
+                MouseMoved?.Invoke(polled);
+                MouseDelta?.Invoke(delta);
+            }
+            _mousePos = polled;
+            _lastMousePos = polled;
         }
 
         protected override void OnRenderFrame(FrameEventArgs e)
@@ -228,48 +259,41 @@ namespace ILGPU_Raytracing.Engine
             base.OnRenderFrame(e);
             if (_isClosing) return;
 
-            // Low-latency camera update on GL thread.
             float dt = (float)Math.Clamp(e.Time, 0.0, 0.25);
             _renderer.UpdateCamera(dt);
 
-            // Drain to the newest ready slot (drop older).
+            // Hand out at most one render "ticket" per GL frame (cap backlog to ~2 tickets total).
+            if (_frameBudget.CurrentCount < 2) _frameBudget.Release();
+
             int toPresentSlot = -1;
             while (_readySlots.TryDequeue(out int s))
             {
                 if (toPresentSlot != -1)
                 {
-                    // Drop older ready: mark it free immediately (we'll overwrite its device buffer next time).
                     _freePbos.Enqueue(s);
                     _freeEvent.Set();
                 }
                 toPresentSlot = s;
             }
 
-            // Copy device→PBO (mapped) and upload to texture
             if (toPresentSlot != -1)
             {
-                // Choose a PBO to carry this frame (use same slot index for clarity).
                 int pboIndex = toPresentSlot;
 
-                // Copy from device framebuffer[slot] → mapped PBO
                 _renderer.CopyDeviceToPbo(toPresentSlot, _pbos[pboIndex].Buf, _rtWidth, _rtHeight);
 
-                // Upload PBO → GL texture
                 GL.ActiveTexture(TextureUnit.Texture0);
                 GL.BindTexture(TextureTarget.Texture2D, _texture);
                 GL.BindBuffer(BufferTarget.PixelUnpackBuffer, _pbos[pboIndex].Buf.glBufferHandle);
                 GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
-                GL.TexSubImage2D(TextureTarget.Texture2D, 0, 0, 0,
-                                 _rtWidth, _rtHeight, PixelFormat.Bgra, PixelType.UnsignedByte, IntPtr.Zero);
+                GL.TexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, _rtWidth, _rtHeight, PixelFormat.Bgra, PixelType.UnsignedByte, IntPtr.Zero);
                 GL.BindBuffer(BufferTarget.PixelUnpackBuffer, 0);
 
-                // Fence this PBO's DMA; recycle when signaled
                 IntPtr fence = GL.FenceSync(SyncCondition.SyncGpuCommandsComplete, WaitSyncFlags.None);
                 _pbos[pboIndex].Fence = fence;
                 _inFlightPbos.Add(pboIndex);
             }
 
-            // Recycle in-flight PBOs once DMA completed
             for (int i = _inFlightPbos.Count - 1; i >= 0; --i)
             {
                 int idx = _inFlightPbos[i];
@@ -282,15 +306,12 @@ namespace ILGPU_Raytracing.Engine
                         GL.DeleteSync(f);
                         _pbos[idx].Fence = IntPtr.Zero;
                         _inFlightPbos.RemoveAt(i);
-
-                        // That slot is free for worker to render next frame
                         _freePbos.Enqueue(idx);
                         _freeEvent.Set();
                     }
                 }
             }
 
-            // ====== Perf title ======
             double now = _perfSw.Elapsed.TotalSeconds;
             _frameSamples.Enqueue((now, e.Time));
             while (_frameSamples.Count > 0 && _frameSamples.Peek().t < now - FpsWindowSec)
@@ -311,7 +332,6 @@ namespace ILGPU_Raytracing.Engine
                 _lastTitleUpdateT = now;
             }
 
-            // ====== Blit ======
             GL.Viewport(0, 0, Size.X, Size.Y);
             GL.Clear(ClearBufferMask.ColorBufferBit);
 
@@ -407,9 +427,6 @@ namespace ILGPU_Raytracing.Engine
         {
             base.OnMouseMove(e);
             _mousePos = e.Position;
-            _mouseDeltaAccum += e.Delta;
-            MouseMoved?.Invoke(_mousePos);
-            MouseDelta?.Invoke(e.Delta);
         }
         protected override void OnMouseDown(MouseButtonEventArgs e)
         {
@@ -435,9 +452,9 @@ namespace ILGPU_Raytracing.Engine
         public void SetMouseCapture(bool capture)
         {
             _mouseCaptured = capture;
-            CursorState = capture ? OpenTK.Windowing.Common.CursorState.Grabbed
-                                  : OpenTK.Windowing.Common.CursorState.Normal;
+            CursorState = capture ? OpenTK.Windowing.Common.CursorState.Grabbed : OpenTK.Windowing.Common.CursorState.Normal;
             _mouseDeltaAccum = Vector2.Zero;
+            _lastMousePos = MouseState.Position;
         }
         public bool IsKeyDown(Keys key) => KeyboardState.IsKeyDown(key);
         public bool IsMouseDown(MouseButton btn) => MouseState.IsButtonDown(btn);
@@ -446,9 +463,13 @@ namespace ILGPU_Raytracing.Engine
 
         public Vector2 ConsumeMouseDelta()
         {
-            var d = _mouseDeltaAccum;
+            Vector2 polled = MouseState.Position;
+            Vector2 d = _mouseCaptured ? (polled - _lastMousePos) : Vector2.Zero;
+            _lastMousePos = polled;
+            var accum = _mouseDeltaAccum;
             _mouseDeltaAccum = Vector2.Zero;
-            return new Vector2(-d.X, d.Y);
+            Vector2 total = d + accum;
+            return new Vector2(-total.X, total.Y);
         }
 
         // ---------------- PBO / GL helpers ----------------
@@ -528,8 +549,7 @@ namespace ILGPU_Raytracing.Engine
         {
             int tex = GL.GenTexture();
             GL.BindTexture(TextureTarget.Texture2D, tex);
-            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, width, height, 0,
-                          PixelFormat.Bgra, PixelType.UnsignedByte, IntPtr.Zero);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, width, height, 0, PixelFormat.Bgra, PixelType.UnsignedByte, IntPtr.Zero);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);

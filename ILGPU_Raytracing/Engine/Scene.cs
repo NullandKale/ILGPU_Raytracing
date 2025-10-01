@@ -1,15 +1,12 @@
-﻿
-// ==============================
+﻿// ==============================
 // File: Engine/Scene.cs
-// Replaces your existing Scene.cs (adds UVs/materials/textures pipeline and uploads)
+// Replaces your existing Scene.cs (adds UVs/materials/textures pipeline and uploads + alpha map remap/upload)
 // ==============================
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.Runtime.CompilerServices;
 using ILGPU;
-using ILGPU.Algorithms;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
 
@@ -32,7 +29,7 @@ namespace ILGPU_Raytracing.Engine
         private readonly List<Float3> _hMeshPositions = new List<Float3>();
         private readonly List<MeshTri> _hMeshTris = new List<MeshTri>();
 
-        // New: UVs, per-tri UV indices, per-tri material index, materials, textures
+        // UVs/materials/textures
         private readonly List<Float2> _hMeshTexcoords = new List<Float2>();
         private readonly List<MeshTriUV> _hMeshTriUVs = new List<MeshTriUV>();
         private readonly List<int> _hTriMaterialIndex = new List<int>();
@@ -53,7 +50,6 @@ namespace ILGPU_Raytracing.Engine
         private MemoryBuffer1D<Float3, Stride1D.Dense> _dMeshPositions;
         private MemoryBuffer1D<MeshTri, Stride1D.Dense> _dMeshTris;
 
-        // New device buffers
         private MemoryBuffer1D<Float2, Stride1D.Dense> _dMeshTexcoords;
         private MemoryBuffer1D<MeshTriUV, Stride1D.Dense> _dMeshTriUVs;
         private MemoryBuffer1D<int, Stride1D.Dense> _dTriMaterialIndex;
@@ -67,23 +63,22 @@ namespace ILGPU_Raytracing.Engine
             UploadAll();
         }
 
-        public ArrayView<TLASNode> TLASNodesView { get { return _dTLASNodes.View; } }
-        public ArrayView<int> TLASInstanceIndicesView { get { return _dTLASInstanceIndices.View; } }
-        public ArrayView<InstanceRecord> InstancesView { get { return _dInstances.View; } }
-        public ArrayView<BLASNode> BLASNodesView { get { return _dBLASNodes.View; } }
-        public ArrayView<int> SpherePrimIndicesView { get { return _dSpherePrimIndices.View; } }
-        public ArrayView<Sphere> SpheresView { get { return _dSpheres.View; } }
-        public ArrayView<int> TriPrimIndicesView { get { return _dTriPrimIndices.View; } }
-        public ArrayView<Float3> MeshPositionsView { get { return _dMeshPositions.View; } }
-        public ArrayView<MeshTri> MeshTrisView { get { return _dMeshTris.View; } }
+        public ArrayView<TLASNode> TLASNodesView => _dTLASNodes.View;
+        public ArrayView<int> TLASInstanceIndicesView => _dTLASInstanceIndices.View;
+        public ArrayView<InstanceRecord> InstancesView => _dInstances.View;
+        public ArrayView<BLASNode> BLASNodesView => _dBLASNodes.View;
+        public ArrayView<int> SpherePrimIndicesView => _dSpherePrimIndices.View;
+        public ArrayView<Sphere> SpheresView => _dSpheres.View;
+        public ArrayView<int> TriPrimIndicesView => _dTriPrimIndices.View;
+        public ArrayView<Float3> MeshPositionsView => _dMeshPositions.View;
+        public ArrayView<MeshTri> MeshTrisView => _dMeshTris.View;
 
-        // New public views
-        public ArrayView<Float2> MeshTexcoordsView { get { return _dMeshTexcoords.View; } }
-        public ArrayView<MeshTriUV> MeshTriUVsView { get { return _dMeshTriUVs.View; } }
-        public ArrayView<int> TriMaterialIndexView { get { return _dTriMaterialIndex.View; } }
-        public ArrayView<MaterialRecord> MaterialsView { get { return _dMaterials.View; } }
-        public ArrayView<RGBA32> TexelsView { get { return _dTexels.View; } }
-        public ArrayView<TexInfo> TexInfosView { get { return _dTexInfos.View; } }
+        public ArrayView<Float2> MeshTexcoordsView => _dMeshTexcoords.View;
+        public ArrayView<MeshTriUV> MeshTriUVsView => _dMeshTriUVs.View;
+        public ArrayView<int> TriMaterialIndexView => _dTriMaterialIndex.View;
+        public ArrayView<MaterialRecord> MaterialsView => _dMaterials.View;
+        public ArrayView<RGBA32> TexelsView => _dTexels.View;
+        public ArrayView<TexInfo> TexInfosView => _dTexInfos.View;
 
         public void BuildDefaultScene()
         {
@@ -100,16 +95,44 @@ namespace ILGPU_Raytracing.Engine
             _hTexInfos.Clear();
             _hTexels.Clear();
 
-            int ground = AddSphere(new Sphere { center = new Float3(0f, -1000.5f, 0f), radius = 1000f, albedo = new Float3(0.8f, 0.8f, 0.8f) });
-            int s0 = AddSphere(new Sphere { center = new Float3(-0.9f, 0.5f, -0.2f), radius = 0.5f, albedo = new Float3(0.8f, 0.3f, 0.3f) });
-            int s1 = AddSphere(new Sphere { center = new Float3(0.9f, 0.35f, 0.2f), radius = 0.35f, albedo = new Float3(0.3f, 0.8f, 0.3f) });
-            int s2 = AddSphere(new Sphere { center = new Float3(0.0f, 0.75f, 0.6f), radius = 0.75f, albedo = new Float3(0.3f, 0.3f, 0.9f) });
+            int AddCheckerTexture(int w, int h, int step, RGBA32 c0, RGBA32 c1)
+            {
+                int offset = _hTexels.Count;
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                    {
+                        bool a = (((x / step) + (y / step)) & 1) == 0;
+                        _hTexels.Add(a ? c0 : c1);
+                    }
+                _hTexInfos.Add(new TexInfo { Offset = offset, Width = w, Height = h });
+                return _hTexInfos.Count - 1;
+            }
 
-            List<InstanceRecord> inst = new List<InstanceRecord>();
-            inst.Add(BuildSphereInstance(new int[] { ground }, Affine3x4.Identity()));
-            inst.Add(BuildSphereInstance(new int[] { s0 }, Affine3x4.Identity()));
-            inst.Add(BuildSphereInstance(new int[] { s1 }, Affine3x4.Identity()));
-            inst.Add(BuildSphereInstance(new int[] { s2 }, Affine3x4.Identity()));
+            int checker0 = AddCheckerTexture(256, 256, 16, new RGBA32 { R = 255, G = 255, B = 255, A = 255 }, new RGBA32 { R = 20, G = 20, B = 20, A = 255 });
+            int checker1 = AddCheckerTexture(256, 256, 8, new RGBA32 { R = 40, G = 40, B = 200, A = 255 }, new RGBA32 { R = 200, G = 200, B = 40, A = 255 });
+
+            var matGround = new MaterialRecord { Kd = new Float3(1f, 1f, 1f), HasDiffuseMap = 1, DiffuseTexIndex = checker0, Shading = MaterialRecord.SHADING_LAMBERT, IOR = 1f, HasAlphaMap = 0, AlphaTexIndex = -1, AlphaCutoff = 0.5f, TwoSided = 0 };
+            var matRed = new MaterialRecord { Kd = new Float3(0.8f, 0.3f, 0.3f), HasDiffuseMap = 0, DiffuseTexIndex = -1, Shading = MaterialRecord.SHADING_LAMBERT, IOR = 1f, HasAlphaMap = 0, AlphaTexIndex = -1, AlphaCutoff = 0.5f, TwoSided = 0 };
+            var matGreen = new MaterialRecord { Kd = new Float3(0.3f, 0.8f, 0.3f), HasDiffuseMap = 0, DiffuseTexIndex = -1, Shading = MaterialRecord.SHADING_LAMBERT, IOR = 1f, HasAlphaMap = 0, AlphaTexIndex = -1, AlphaCutoff = 0.5f, TwoSided = 0 };
+            var matTex = new MaterialRecord { Kd = new Float3(1f, 1f, 1f), HasDiffuseMap = 1, DiffuseTexIndex = checker1, Shading = MaterialRecord.SHADING_LAMBERT, IOR = 1f, HasAlphaMap = 0, AlphaTexIndex = -1, AlphaCutoff = 0.5f, TwoSided = 0 };
+            var matWhite = new MaterialRecord { Kd = new Float3(1f, 1f, 1f), HasDiffuseMap = 0, DiffuseTexIndex = -1, Shading = MaterialRecord.SHADING_LAMBERT, IOR = 1f, HasAlphaMap = 0, AlphaTexIndex = -1, AlphaCutoff = 0.5f, TwoSided = 0 };
+
+            int ground = AddSphere(new Sphere { center = new Float3(0f, -1000.5f, 0f), radius = 1000f, albedo = new Float3(1f, 1f, 1f), material = matGround, shading = Sphere.SHADING_LAMBERT, ior = 1f });
+            int s0 = AddSphere(new Sphere { center = new Float3(-0.9f, 0.5f, -0.2f), radius = 0.5f, albedo = new Float3(0.8f, 0.3f, 0.3f), material = matRed, shading = Sphere.SHADING_LAMBERT, ior = 1f });
+            int s1 = AddSphere(new Sphere { center = new Float3(0.9f, 0.35f, 0.2f), radius = 0.35f, albedo = new Float3(0.3f, 0.8f, 0.3f), material = matGreen, shading = Sphere.SHADING_LAMBERT, ior = 1f });
+            int s2 = AddSphere(new Sphere { center = new Float3(0.0f, 0.75f, 0.6f), radius = 0.75f, albedo = new Float3(1f, 1f, 1f), material = matTex, shading = Sphere.SHADING_LAMBERT, ior = 1f });
+            int sMirror = AddSphere(new Sphere { center = new Float3(-1.8f, 0.5f, 0.8f), radius = 0.5f, albedo = new Float3(1f, 1f, 1f), material = matWhite, shading = Sphere.SHADING_MIRROR, ior = 1f });
+            int sGlass = AddSphere(new Sphere { center = new Float3(1.8f, 0.5f, -0.8f), radius = 0.5f, albedo = new Float3(1f, 1f, 1f), material = matWhite, shading = Sphere.SHADING_GLASS, ior = 1.5f });
+
+            var inst = new List<InstanceRecord>
+            {
+                BuildSphereInstance(new int[] { ground },  Affine3x4.Identity()),
+                BuildSphereInstance(new int[] { s0 },      Affine3x4.Identity()),
+                BuildSphereInstance(new int[] { s1 },      Affine3x4.Identity()),
+                BuildSphereInstance(new int[] { s2 },      Affine3x4.Identity()),
+                BuildSphereInstance(new int[] { sMirror }, Affine3x4.Identity()),
+                BuildSphereInstance(new int[] { sGlass },  Affine3x4.Identity()),
+            };
 
             _hInstances = inst.ToArray();
 
@@ -121,20 +144,18 @@ namespace ILGPU_Raytracing.Engine
         public void LoadObjInstance(string objPath, Affine3x4 objectToWorld, float uniformScale = 1f)
         {
             if (string.IsNullOrWhiteSpace(objPath) || !File.Exists(objPath))
-            {
                 throw new FileNotFoundException("OBJ file not found.", objPath);
-            }
 
-            MeshHost mesh = MeshLoaderOBJ.Load(objPath, uniformScale, false);
+            MeshHost mesh = MeshLoaderOBJ.Load(objPath, uniformScale, flipWinding: false);
 
             int baseVertex = _hMeshPositions.Count;
             int baseTri = _hMeshTris.Count;
             int baseUV = _hMeshTexcoords.Count;
             int baseMat = _hMaterials.Count;
-            int triCountBefore = _hTriPrimIndices.Count;
 
             _hMeshPositions.AddRange(mesh.Positions);
             _hMeshTexcoords.AddRange(mesh.Texcoords);
+
             for (int i = 0; i < mesh.Triangles.Count; i++)
             {
                 MeshTri t = mesh.Triangles[i];
@@ -159,31 +180,48 @@ namespace ILGPU_Raytracing.Engine
             // Append materials, remapping each material's texture index to a flattened texel array
             // We store each texture serially and emit TexInfo with offset/size for sampling
             int texBase = _hTexels.Count;
-            int curOffset = texBase;
             var localMatCount = mesh.Materials.Count;
             var matRemapped = new List<MaterialRecord>(localMatCount);
             for (int i = 0; i < localMatCount; i++)
             {
                 var m = mesh.Materials[i];
+
+                // Remap diffuse (map_Kd)
                 if (m.HasDiffuseMap != 0 && m.DiffuseTexIndex >= 0 && m.DiffuseTexIndex < mesh.Textures.Count)
                 {
                     var src = mesh.Textures[m.DiffuseTexIndex];
-                    int w = src.Width;
-                    int h = src.Height;
                     int start = _hTexels.Count;
                     for (int p = 0; p < src.BGRA.Length; p += 4)
-                    {
                         _hTexels.Add(new RGBA32 { B = src.BGRA[p + 0], G = src.BGRA[p + 1], R = src.BGRA[p + 2], A = src.BGRA[p + 3] });
-                    }
                     int texIndexGlobal = _hTexInfos.Count;
-                    _hTexInfos.Add(new TexInfo { Offset = start, Width = w, Height = h });
+                    _hTexInfos.Add(new TexInfo { Offset = start, Width = src.Width, Height = src.Height });
                     m.DiffuseTexIndex = texIndexGlobal;
+                    m.HasDiffuseMap = 1;
                 }
                 else
                 {
                     m.HasDiffuseMap = 0;
                     m.DiffuseTexIndex = -1;
                 }
+
+                // NEW: remap alpha (map_d)
+                if (m.HasAlphaMap != 0 && m.AlphaTexIndex >= 0 && m.AlphaTexIndex < mesh.Textures.Count)
+                {
+                    var srcA = mesh.Textures[m.AlphaTexIndex];
+                    int startA = _hTexels.Count;
+                    for (int p = 0; p < srcA.BGRA.Length; p += 4)
+                        _hTexels.Add(new RGBA32 { B = srcA.BGRA[p + 0], G = srcA.BGRA[p + 1], R = srcA.BGRA[p + 2], A = srcA.BGRA[p + 3] });
+                    int texIndexGlobalA = _hTexInfos.Count;
+                    _hTexInfos.Add(new TexInfo { Offset = startA, Width = srcA.Width, Height = srcA.Height });
+                    m.AlphaTexIndex = texIndexGlobalA;
+                    m.HasAlphaMap = 1;
+                }
+                else
+                {
+                    m.HasAlphaMap = 0;
+                    m.AlphaTexIndex = -1;
+                }
+
                 matRemapped.Add(m);
             }
             _hMaterials.AddRange(matRemapped);
@@ -194,11 +232,8 @@ namespace ILGPU_Raytracing.Engine
             BuildBLAS_Triangles(_hBLASNodes, _hTriPrimIndices, baseTri, mesh.Triangles.Count, _hMeshPositions);
             int blasCount = _hBLASNodes.Count - blasStart;
 
-            Float3 bmin; Float3 bmax;
-            ComputeMeshBounds(mesh.Positions, mesh.Triangles, out bmin, out bmax);
-
-            Float3 wmin; Float3 wmax;
-            TransformAABB(objectToWorld, bmin, bmax, out wmin, out wmax);
+            ComputeMeshBounds(mesh.Positions, mesh.Triangles, out var bmin, out var bmax);
+            TransformAABB(objectToWorld, bmin, bmax, out var wmin, out var wmax);
 
             Affine3x4 worldToObject = InvertRigidOrUniform(objectToWorld, out float uniScale);
 
@@ -214,8 +249,7 @@ namespace ILGPU_Raytracing.Engine
             instRec.worldBoundsMin = wmin;
             instRec.worldBoundsMax = wmax;
 
-            var instList = new List<InstanceRecord>(_hInstances);
-            instList.Add(instRec);
+            var instList = new List<InstanceRecord>(_hInstances) { instRec };
             _hInstances = instList.ToArray();
 
             RebuildTLAS(_hInstances, out _hTLASNodes, out _hTLASInstanceIndices);
@@ -244,7 +278,22 @@ namespace ILGPU_Raytracing.Engine
             _dTexInfos.DisposeIfValid(); _dTexInfos = AllocateOrEmpty((_hTexInfos != null ? _hTexInfos.ToArray() : Array.Empty<TexInfo>()));
         }
 
-        public void GetDeviceViews(out ArrayView<TLASNode> tlasNodes, out ArrayView<int> tlasInstanceIndices, out ArrayView<InstanceRecord> instances, out ArrayView<BLASNode> blasNodes, out ArrayView<int> spherePrimIdx, out ArrayView<Sphere> spheres, out ArrayView<int> triPrimIdx, out ArrayView<Float3> meshPositions, out ArrayView<MeshTri> meshTris, out ArrayView<Float2> meshTexcoords, out ArrayView<MeshTriUV> meshTriUVs, out ArrayView<int> triMatIndex, out ArrayView<MaterialRecord> materials, out ArrayView<RGBA32> texels, out ArrayView<TexInfo> texInfos)
+        public void GetDeviceViews(
+            out ArrayView<TLASNode> tlasNodes,
+            out ArrayView<int> tlasInstanceIndices,
+            out ArrayView<InstanceRecord> instances,
+            out ArrayView<BLASNode> blasNodes,
+            out ArrayView<int> spherePrimIdx,
+            out ArrayView<Sphere> spheres,
+            out ArrayView<int> triPrimIdx,
+            out ArrayView<Float3> meshPositions,
+            out ArrayView<MeshTri> meshTris,
+            out ArrayView<Float2> meshTexcoords,
+            out ArrayView<MeshTriUV> meshTriUVs,
+            out ArrayView<int> triMatIndex,
+            out ArrayView<MaterialRecord> materials,
+            out ArrayView<RGBA32> texels,
+            out ArrayView<TexInfo> texInfos)
         {
             tlasNodes = _dTLASNodes.View;
             tlasInstanceIndices = _dTLASInstanceIndices.View;
@@ -289,9 +338,7 @@ namespace ILGPU_Raytracing.Engine
             BuildBLAS_Spheres(_hBLASNodes, _hSpherePrimIndices, primStart, primCount, _hSpheres);
             int blasCount = _hBLASNodes.Count - blasStart;
 
-            Float3 wmin; Float3 wmax;
-            TransformAABB(objectToWorld, bmin, bmax, out wmin, out wmax);
-
+            TransformAABB(objectToWorld, bmin, bmax, out var wmin, out var wmax);
             Affine3x4 worldToObject = InvertRigidOrUniform(objectToWorld, out float uniScale);
 
             InstanceRecord inst = default;
@@ -312,11 +359,9 @@ namespace ILGPU_Raytracing.Engine
         {
             int n = instances.Length;
             int[] idx = new int[n];
-            for (int i = 0; i < n; i++)
-            {
-                idx[i] = i;
-            }
-            List<TLASNode> outNodes = new List<TLASNode>(2 * n);
+            for (int i = 0; i < n; i++) idx[i] = i;
+
+            var outNodes = new List<TLASNode>(2 * n);
             BuildTLASNodeRecursive(instances, idx, 0, n, outNodes, -1);
             nodes = outNodes.ToArray();
             instanceIndices = idx;
@@ -325,21 +370,18 @@ namespace ILGPU_Raytracing.Engine
         private MemoryBuffer1D<T, Stride1D.Dense> AllocateOrEmpty<T>(T[] src) where T : unmanaged
         {
             if (src != null && src.Length > 0)
-            {
                 return _cuda.Allocate1D(src);
-            }
             var buf = _cuda.Allocate1D<T>(1);
             buf.MemSetToZero();
             return buf;
         }
 
+        // ----- BLAS/TLAS builders (unchanged from your version) -----
+
         private static void BuildBLAS_Spheres(List<BLASNode> outBLAS, List<int> primIdx, int primStart, int primCount, List<Sphere> spheres)
         {
             int[] idx = new int[primCount];
-            for (int i = 0; i < primCount; i++)
-            {
-                idx[i] = primStart + i;
-            }
+            for (int i = 0; i < primCount; i++) idx[i] = primStart + i;
 
             Float3[] bmin = new Float3[primCount];
             Float3[] bmax = new Float3[primCount];
@@ -356,10 +398,7 @@ namespace ILGPU_Raytracing.Engine
         private static void BuildBLAS_Triangles(List<BLASNode> outBLAS, List<int> primIdx, int primStart, int primCount, List<Float3> positions)
         {
             int[] idx = new int[primCount];
-            for (int i = 0; i < primCount; i++)
-            {
-                idx[i] = primStart + i;
-            }
+            for (int i = 0; i < primCount; i++) idx[i] = primStart + i;
             BuildBLASNodeRecursive(outBLAS, primIdx, idx, 0, primCount, null, null, -1, null, positions);
         }
 
@@ -367,11 +406,7 @@ namespace ILGPU_Raytracing.Engine
         {
             int nodeIndex = outBLAS.Count;
             BLASNode node = default;
-            node.first = -1;
-            node.count = 0;
-            node.left = -1;
-            node.right = -1;
-            node.skipIndex = parentSkip;
+            node.first = -1; node.count = 0; node.left = -1; node.right = -1; node.skipIndex = parentSkip;
 
             Float3 nbMin = new Float3(float.MaxValue, float.MaxValue, float.MaxValue);
             Float3 nbMax = new Float3(float.MinValue, float.MinValue, float.MinValue);
@@ -388,8 +423,7 @@ namespace ILGPU_Raytracing.Engine
                 for (int i = start; i < start + count; i++)
                 {
                     int triIndex = primIdx[idx[i]];
-                    Float3 mn; Float3 mx;
-                    BoundsOfTriangle(triIndex, positionsOrNull, out mn, out mx);
+                    BoundsOfTriangle(triIndex, positionsOrNull, out var mn, out var mx);
                     nbMin = Float3.Min(nbMin, mn);
                     nbMax = Float3.Max(nbMax, mx);
                 }
@@ -397,21 +431,15 @@ namespace ILGPU_Raytracing.Engine
 
             node.boundsMin = nbMin;
             node.boundsMax = nbMax;
-
             outBLAS.Add(node);
 
             const int LeafThreshold = 4;
             if (count <= LeafThreshold)
             {
                 int leafStart = primIdx.Count;
-                for (int i = start; i < start + count; i++)
-                {
-                    primIdx.Add(primIdx[idx[i]]);
-                }
+                for (int i = start; i < start + count; i++) primIdx.Add(primIdx[idx[i]]);
                 BLASNode leaf = outBLAS[nodeIndex];
-                leaf.first = leafStart;
-                leaf.count = count;
-                leaf.skipIndex = parentSkip;
+                leaf.first = leafStart; leaf.count = count; leaf.skipIndex = parentSkip;
                 outBLAS[nodeIndex] = leaf;
                 return nodeIndex;
             }
@@ -422,13 +450,9 @@ namespace ILGPU_Raytracing.Engine
             else if (extent.Z > extent.X && extent.Z >= extent.Y) axis = 2;
 
             if (spheresOrNull != null)
-            {
                 Array.Sort(idx, start, count, new BLASPrimComparatorSpheres(axis, primIdx, spheresOrNull));
-            }
             else
-            {
                 Array.Sort(idx, start, count, new BLASPrimComparatorTris(axis, primIdx, positionsOrNull));
-            }
 
             int mid = start + (count >> 1);
 
@@ -436,9 +460,7 @@ namespace ILGPU_Raytracing.Engine
             int leftRoot = BuildBLASNodeRecursive(outBLAS, primIdx, idx, start, mid - start, bminPre, bmaxPre, rightRoot, spheresOrNull, positionsOrNull);
 
             BLASNode inner = outBLAS[nodeIndex];
-            inner.left = leftRoot;
-            inner.right = rightRoot;
-            inner.skipIndex = parentSkip;
+            inner.left = leftRoot; inner.right = rightRoot; inner.skipIndex = parentSkip;
             outBLAS[nodeIndex] = inner;
 
             return nodeIndex;
@@ -448,11 +470,7 @@ namespace ILGPU_Raytracing.Engine
         {
             int nodeIndex = outNodes.Count;
             TLASNode node = default;
-            node.first = -1;
-            node.count = 0;
-            node.left = -1;
-            node.right = -1;
-            node.skipIndex = parentSkip;
+            node.first = -1; node.count = 0; node.left = -1; node.right = -1; node.skipIndex = parentSkip;
 
             Float3 nbMin = new Float3(float.MaxValue, float.MaxValue, float.MaxValue);
             Float3 nbMax = new Float3(float.MinValue, float.MinValue, float.MinValue);
@@ -462,17 +480,14 @@ namespace ILGPU_Raytracing.Engine
                 nbMin = Float3.Min(nbMin, r.worldBoundsMin);
                 nbMax = Float3.Max(nbMax, r.worldBoundsMax);
             }
-            node.boundsMin = nbMin;
-            node.boundsMax = nbMax;
+            node.boundsMin = nbMin; node.boundsMax = nbMax;
             outNodes.Add(node);
 
             const int LeafThreshold = 2;
             if (count <= LeafThreshold)
             {
                 TLASNode leaf = outNodes[nodeIndex];
-                leaf.first = start;
-                leaf.count = count;
-                leaf.skipIndex = parentSkip;
+                leaf.first = start; leaf.count = count; leaf.skipIndex = parentSkip;
                 outNodes[nodeIndex] = leaf;
                 return nodeIndex;
             }
@@ -485,16 +500,12 @@ namespace ILGPU_Raytracing.Engine
             Array.Sort(idx, start, count, new TLASInstComparator(axis, inst));
 
             int mid = start + (count >> 1);
-
             int rightRoot = BuildTLASNodeRecursive(inst, idx, mid, count - (mid - start), outNodes, parentSkip);
             int leftRoot = BuildTLASNodeRecursive(inst, idx, start, mid - start, outNodes, rightRoot);
 
             TLASNode inner = outNodes[nodeIndex];
-            inner.left = leftRoot;
-            inner.right = rightRoot;
-            inner.skipIndex = parentSkip;
+            inner.left = leftRoot; inner.right = rightRoot; inner.skipIndex = parentSkip;
             outNodes[nodeIndex] = inner;
-
             return nodeIndex;
         }
 
@@ -506,15 +517,11 @@ namespace ILGPU_Raytracing.Engine
             public BLASPrimComparatorSpheres(int axis, List<int> primIdx, List<Sphere> spheres) { _axis = axis; _primIdx = primIdx; _spheres = spheres; }
             public int Compare(int a, int b)
             {
-                int ia = _primIdx[a];
-                int ib = _primIdx[b];
-                Sphere sa = _spheres[ia];
-                Sphere sb = _spheres[ib];
+                int ia = _primIdx[a], ib = _primIdx[b];
+                Sphere sa = _spheres[ia], sb = _spheres[ib];
                 float ca = _axis == 0 ? sa.center.X : (_axis == 1 ? sa.center.Y : sa.center.Z);
                 float cb = _axis == 0 ? sb.center.X : (_axis == 1 ? sb.center.Y : sb.center.Z);
-                if (ca < cb) return -1;
-                if (ca > cb) return 1;
-                return 0;
+                if (ca < cb) return -1; if (ca > cb) return 1; return 0;
             }
         }
 
@@ -526,15 +533,12 @@ namespace ILGPU_Raytracing.Engine
             public BLASPrimComparatorTris(int axis, List<int> primIdx, List<Float3> positions) { _axis = axis; _primIdx = primIdx; _positions = positions; }
             public int Compare(int a, int b)
             {
-                int ia = _primIdx[a];
-                int ib = _primIdx[b];
+                int ia = _primIdx[a], ib = _primIdx[b];
                 Float3 ca = CenterOfTriangle(ia, _positions);
                 Float3 cb = CenterOfTriangle(ib, _positions);
                 float va = _axis == 0 ? ca.X : (_axis == 1 ? ca.Y : ca.Z);
                 float vb = _axis == 0 ? cb.X : (_axis == 1 ? cb.Y : cb.Z);
-                if (va < vb) return -1;
-                if (va > vb) return 1;
-                return 0;
+                if (va < vb) return -1; if (va > vb) return 1; return 0;
             }
         }
 
@@ -549,9 +553,7 @@ namespace ILGPU_Raytracing.Engine
                 Float3 cb = Float3.Center(_inst[b].worldBoundsMin, _inst[b].worldBoundsMax);
                 float va = _axis == 0 ? ca.X : (_axis == 1 ? ca.Y : ca.Z);
                 float vb = _axis == 0 ? cb.X : (_axis == 1 ? cb.Y : cb.Z);
-                if (va < vb) return -1;
-                if (va > vb) return 1;
-                return 0;
+                if (va < vb) return -1; if (va > vb) return 1; return 0;
             }
         }
 
@@ -574,8 +576,7 @@ namespace ILGPU_Raytracing.Engine
                 mn = Float3.Min(mn, w);
                 mx = Float3.Max(mx, w);
             }
-            outMin = mn;
-            outMax = mx;
+            outMin = mn; outMax = mx;
         }
 
         private static void ComputeMeshBounds(List<Float3> pos, List<MeshTri> tris, out Float3 bmin, out Float3 bmax)
@@ -609,7 +610,7 @@ namespace ILGPU_Raytracing.Engine
             Float3 v0 = positions[tri.i0];
             Float3 v1 = positions[tri.i1];
             Float3 v2 = positions[tri.i2];
-            return new Float3((v0.X + v1.X + v2.X) * (1f / 3f), (v0.Y + v1.Y + v2.Y) * (1f / 3f), (v0.Z + v1.Z + v2.Z) * (1f / 3f));
+            return new Float3((v0.X + v1.X + v2.X) / 3f, (v0.Y + v1.Y + v2.Y) / 3f, (v0.Z + v1.Z + v2.Z) / 3f);
         }
 
         private static Affine3x4 InvertRigidOrUniform(Affine3x4 m, out float uniformScale)
@@ -638,12 +639,16 @@ namespace ILGPU_Raytracing.Engine
 
         private static Float3 TransformPoint(Affine3x4 m, Float3 p)
         {
-            return new Float3(m.m00 * p.X + m.m01 * p.Y + m.m02 * p.Z + m.m03, m.m10 * p.X + m.m11 * p.Y + m.m12 * p.Z + m.m13, m.m20 * p.X + m.m21 * p.Y + m.m22 * p.Z + m.m23);
+            return new Float3(m.m00 * p.X + m.m01 * p.Y + m.m02 * p.Z + m.m03,
+                              m.m10 * p.X + m.m11 * p.Y + m.m12 * p.Z + m.m13,
+                              m.m20 * p.X + m.m21 * p.Y + m.m22 * p.Z + m.m23);
         }
 
         private static Float3 TransformVector(Affine3x4 m, Float3 v)
         {
-            return new Float3(m.m00 * v.X + m.m01 * v.Y + m.m02 * v.Z, m.m10 * v.X + m.m11 * v.Y + m.m12 * v.Z, m.m20 * v.X + m.m21 * v.Y + m.m22 * v.Z);
+            return new Float3(m.m00 * v.X + m.m01 * v.Y + m.m02 * v.Z,
+                              m.m10 * v.X + m.m11 * v.Y + m.m12 * v.Z,
+                              m.m20 * v.X + m.m21 * v.Y + m.m22 * v.Z);
         }
 
         private bool TryAddSponzaFromKnownLocations()
@@ -654,7 +659,7 @@ namespace ILGPU_Raytracing.Engine
             {
                 Path.Combine(baseDir, "Sponza", "sponza.obj"),
                 Path.Combine(curDir, "Sponza", "sponza.obj"),
-                @"C:\Users\alec\source\repos\ILGPU_Raytracing\ILGPU_Raytracing\bin\Debug\net8.0\Sponza\sponza.obj"
+                @"C:\Users\alec\source\repos\ILGPU_Raytracing\ILGPU_Raytracing\bin\Debug\net8.0\Assets\Sponza\sponza.obj"
             };
 
             foreach (var p in candidates)
@@ -695,11 +700,7 @@ namespace ILGPU_Raytracing.Engine
         public static MeshTri ResolveTri(int globalTriIndex) { return _trisRef[globalTriIndex]; }
     }
 
-    public enum BlasType
-    {
-        SphereSet = 1,
-        TriMesh = 2
-    }
+    public enum BlasType { SphereSet = 1, TriMesh = 2 }
 
     public struct TLASNode
     {
@@ -737,31 +738,17 @@ namespace ILGPU_Raytracing.Engine
         public int skipIndex;
     }
 
-    public struct MeshTri
-    {
-        public int i0;
-        public int i1;
-        public int i2;
-    }
+    public struct MeshTri { public int i0, i1, i2; }
 
-    public struct RGBA32
-    {
-        public byte R;
-        public byte G;
-        public byte B;
-        public byte A;
-    }
+    public struct RGBA32 { public byte R, G, B, A; }
 
-    public struct TexInfo
-    {
-        public int Offset;
-        public int Width;
-        public int Height;
-    }
+    public struct TexInfo { public int Offset, Width, Height; }
 
     public static class BufferUtils
     {
-        public static void DisposeIfValid(this MemoryBuffer buf) { if (buf != null) { buf.Dispose(); } }
-        public static void DisposeIfValid<T, TStride>(this MemoryBuffer1D<T, TStride> buf) where T : unmanaged where TStride : struct, IStride1D { if (buf != null && buf.IsValid) { buf.Dispose(); } }
+        public static void DisposeIfValid(this MemoryBuffer buf) { if (buf != null) buf.Dispose(); }
+        public static void DisposeIfValid<T, TStride>(this MemoryBuffer1D<T, TStride> buf)
+            where T : unmanaged where TStride : struct, IStride1D
+        { if (buf != null && buf.IsValid) buf.Dispose(); }
     }
 }

@@ -14,19 +14,53 @@ namespace ILGPU_Raytracing.Engine
             X = x; Y = y; Z = z;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Float3 operator +(Float3 a, Float3 b)
         {
             return new Float3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Float3 operator -(Float3 a, Float3 b)
         {
             return new Float3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Float3 operator *(Float3 a, float s)
         {
             return new Float3(a.X * s, a.Y * s, a.Z * s);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Float3 operator *(float s, Float3 a)
+        {
+            return new Float3(a.X * s, a.Y * s, a.Z * s);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Float3 operator *(Float3 a, Float3 b)
+        {
+            return new Float3(a.X * b.X, a.Y * b.Y, a.Z * b.Z);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Float3 operator /(Float3 a, float s)
+        {
+            float inv = 1f / s;
+            return new Float3(a.X * inv, a.Y * inv, a.Z * inv);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Float3 operator /(Float3 a, Float3 b)
+        {
+            return new Float3(a.X / b.X, a.Y / b.Y, a.Z / b.Z);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Float3 operator -(Float3 v)
+        {
+            return new Float3(-v.X, -v.Y, -v.Z);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -60,18 +94,19 @@ namespace ILGPU_Raytracing.Engine
             return new Float3(v.X * inv, v.Y * inv, v.Z * inv);
         }
 
-
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Float3 Saturate(Float3 c)
         {
             return new Float3(XMath.Min(1f, XMath.Max(0f, c.X)), XMath.Min(1f, XMath.Max(0f, c.Y)), XMath.Min(1f, XMath.Max(0f, c.Z)));
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float Length(Float3 v)
         {
             return XMath.Sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Float3 Center(Float3 a, Float3 b)
         {
             return new Float3(0.5f * (a.X + b.X), 0.5f * (a.Y + b.Y), 0.5f * (a.Z + b.Z));
