@@ -1,21 +1,16 @@
-﻿
-// ==============================
-// File: Engine/RTWindow.cs
+﻿// ==============================
+// Engine/RTWindow.cs (zero-copy; single-thread; single PBO)
 // ==============================
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.ComponentModel; // CancelEventArgs
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
-using System.Threading;
-using System.Threading.Tasks;
 using ILGPU.Runtime.Cuda;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
-using OpenTK.Windowing.GraphicsLibraryFramework; // Keys, MouseButton
+using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace ILGPU_Raytracing.Engine
 {
@@ -28,60 +23,36 @@ namespace ILGPU_Raytracing.Engine
         private int _vbo;
         private int _program;
         private int _texture;
+        private int _uTexLoc;
 
         private RTRenderer _renderer;
 
-        private struct PboSlot
-        {
-            public CudaGlInteropIndexBuffer Buf; // GL PBO registered with CUDA
-            public IntPtr Fence;                 // GLsync
-        }
-
+        private struct PboSlot { public CudaGlInteropIndexBuffer Buf; }
         private PboSlot[] _pbos = Array.Empty<PboSlot>();
-        private const int PboCount = 2;
+        private const int PboCount = 1;
 
-        // Internal raytracing resolution
-        private int _rtWidth;
-        private int _rtHeight;
+        private int _rtWidth, _rtHeight;
 
-        // ====== Input ======
         private bool _mouseCaptured;
-        private Vector2 _mousePos;
-        private Vector2 _mouseDeltaAccum;
-        private Vector2 _lastMousePos; // polled last position (prevents event backlog)
+        private Vector2 _mousePos, _mouseDeltaAccum, _lastMousePos;
 
-        // ====== Perf stats ======
         private readonly string _baseTitle;
         private readonly Stopwatch _perfSw = new();
-        private readonly Queue<(double t, double dt)> _frameSamples = new();
+        private readonly System.Collections.Generic.Queue<(double t, double dt)> _frameSamples = new();
         private double _lastTitleUpdateT = 0.0;
         private const double FrameTimeWindowSec = 5.0;
         private const double FpsWindowSec = 30.0;
         private const double TitleUpdateHz = 4.0;
 
-        // ====== Shutdown ======
         private bool _isClosing;
+        private int _frameIndex;
 
-        // ====== Worker ======
-        private Thread _workerThread;
-        private CancellationTokenSource _workerCts;
-        private readonly ConcurrentQueue<int> _freePbos = new(); // ready for CUDA render→device buffer
-        private readonly ConcurrentQueue<int> _readySlots = new(); // device buffer slots ready for present (0/1)
-        private readonly List<int> _inFlightPbos = new();          // PBOs DMAing to texture (have fences)
-        private readonly AutoResetEvent _freeEvent = new(false);
-        private readonly AutoResetEvent _readyEvent = new(false);
-
-        // ====== Frame coupling ======
-        private readonly SemaphoreSlim _frameBudget = new(0, 3); // render tickets from GL thread (mailbox: cap backlog)
-
-        // ====== Adaptive resolution cap ======
-        private const int MaxRayPixels = 2_000_000;
+        private const int MaxRayPixels = 1_000_000;
         private const int MinRtDim = 64;
 
         public event Action<Keys>? KeyPressed;
         public event Action<Keys>? KeyReleased;
         public event Action<char>? CharTyped;
-
         public event Action<Vector2>? MouseMoved;
         public event Action<Vector2>? MouseDelta;
         public event Action<MouseButton, Vector2>? MousePressed;
@@ -110,10 +81,10 @@ namespace ILGPU_Raytracing.Engine
             GL.Disable(EnableCap.DepthTest);
             GL.Disable(EnableCap.CullFace);
             GL.ClearColor(0f, 0f, 0f, 1f);
-
             VSync = VSyncMode.On;
 
             _program = CreateProgram(VertexSource(), FragmentSource());
+            _uTexLoc = GL.GetUniformLocation(_program, "uTex");
 
             _vao = GL.GenVertexArray();
             _vbo = GL.GenBuffer();
@@ -130,7 +101,7 @@ namespace ILGPU_Raytracing.Engine
             GL.BufferData(BufferTarget.ArrayBuffer, quad.Length * sizeof(float), quad, BufferUsageHint.StaticDraw);
 
             int aPos = GL.GetAttribLocation(_program, "aPos");
-            int aUV = GL.GetAttribLocation(_program, "aUV");
+            int aUV  = GL.GetAttribLocation(_program, "aUV");
             GL.EnableVertexAttribArray(aPos);
             GL.VertexAttribPointer(aPos, 2, VertexAttribPointerType.Float, false, 4 * sizeof(float), 0);
             GL.EnableVertexAttribArray(aUV);
@@ -138,17 +109,13 @@ namespace ILGPU_Raytracing.Engine
             GL.BindVertexArray(0);
             GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
 
-            // Internal RT size
             (_rtWidth, _rtHeight) = ComputeInternalRT(_initialWidth, _initialHeight);
             _texture = CreateTexture(_rtWidth, _rtHeight);
 
             _renderer = new RTRenderer(this, 0);
 
-            // Create interop PBOs (GL thread)
             CreatePbos(_rtWidth, _rtHeight);
-            EnqueueAllPbosAsFree();
 
-            // Input state
             _mouseCaptured = false;
             _mousePos = Vector2.Zero;
             _mouseDeltaAccum = Vector2.Zero;
@@ -157,85 +124,9 @@ namespace ILGPU_Raytracing.Engine
             _isClosing = false;
             Title = _baseTitle;
             _perfSw.Start();
+            _frameIndex = 0;
             SetMouseCapture(false);
-
-            // Start worker
-            StartWorker();
         }
-
-        // ---------------- Worker management ----------------
-
-        private void StartWorker()
-        {
-            _workerCts = new CancellationTokenSource();
-            _workerThread = new Thread(WorkerLoop) { IsBackground = true, Name = "CUDA-Renderer" };
-            _workerThread.Start(_workerCts.Token);
-        }
-
-        private void StopWorker()
-        {
-            if (_workerThread == null) return;
-            try
-            {
-                _workerCts?.Cancel();
-                _readyEvent.Set();
-                _freeEvent.Set();
-                _frameBudget.Release(3);
-                _workerThread.Join();
-            }
-            catch { }
-            finally
-            {
-                _workerThread = null;
-                _workerCts?.Dispose();
-                _workerCts = null;
-            }
-        }
-
-        private void WorkerLoop(object? arg)
-        {
-            var ct = (CancellationToken)arg!;
-            int frame = 0;
-
-            while (!ct.IsCancellationRequested)
-            {
-                try
-                {
-                    if (!_frameBudget.Wait(5, ct)) continue;
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-
-                if (!_freePbos.TryDequeue(out int slot))
-                {
-                    WaitHandle.WaitAny(new[] { _freeEvent, ct.WaitHandle }, 5);
-                    if (ct.IsCancellationRequested) break;
-                    if (!_freePbos.TryDequeue(out slot))
-                        continue;
-                }
-
-                int w = _rtWidth;
-                int h = _rtHeight;
-
-                try
-                {
-                    _renderer.RenderToDeviceBuffer(slot, w, h, frame++);
-                }
-                catch
-                {
-                    // If resize/shutdown raced, ignore and continue.
-                }
-
-                _readySlots.Enqueue(slot);
-                _readyEvent.Set();
-
-                Thread.Yield();
-            }
-        }
-
-        // ---------------- GL thread (input + present) ----------------
 
         protected override void OnUpdateFrame(FrameEventArgs args)
         {
@@ -262,64 +153,28 @@ namespace ILGPU_Raytracing.Engine
             float dt = (float)Math.Clamp(e.Time, 0.0, 0.25);
             _renderer.UpdateCamera(dt);
 
-            // Hand out at most one render "ticket" per GL frame (cap backlog to ~2 tickets total).
-            if (_frameBudget.CurrentCount < 2) _frameBudget.Release();
+            // Simple pacing: serialize GL consumption vs CUDA production
+            GL.Finish();
 
-            int toPresentSlot = -1;
-            while (_readySlots.TryDequeue(out int s))
-            {
-                if (toPresentSlot != -1)
-                {
-                    _freePbos.Enqueue(s);
-                    _freeEvent.Set();
-                }
-                toPresentSlot = s;
-            }
+            // Zero-copy render → PBO
+            _renderer.RenderDirectToPbo(_pbos[0].Buf, _rtWidth, _rtHeight, _frameIndex, dt);
 
-            if (toPresentSlot != -1)
-            {
-                int pboIndex = toPresentSlot;
+            // Upload PBO to texture
+            GL.ActiveTexture(TextureUnit.Texture0);
+            GL.BindTexture(TextureTarget.Texture2D, _texture);
+            GL.BindBuffer(BufferTarget.PixelUnpackBuffer, _pbos[0].Buf.glBufferHandle);
+            GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+            GL.TexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, _rtWidth, _rtHeight, PixelFormat.Bgra, PixelType.UnsignedByte, IntPtr.Zero);
+            GL.BindBuffer(BufferTarget.PixelUnpackBuffer, 0);
 
-                _renderer.CopyDeviceToPbo(toPresentSlot, _pbos[pboIndex].Buf, _rtWidth, _rtHeight);
-
-                GL.ActiveTexture(TextureUnit.Texture0);
-                GL.BindTexture(TextureTarget.Texture2D, _texture);
-                GL.BindBuffer(BufferTarget.PixelUnpackBuffer, _pbos[pboIndex].Buf.glBufferHandle);
-                GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
-                GL.TexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, _rtWidth, _rtHeight, PixelFormat.Bgra, PixelType.UnsignedByte, IntPtr.Zero);
-                GL.BindBuffer(BufferTarget.PixelUnpackBuffer, 0);
-
-                IntPtr fence = GL.FenceSync(SyncCondition.SyncGpuCommandsComplete, WaitSyncFlags.None);
-                _pbos[pboIndex].Fence = fence;
-                _inFlightPbos.Add(pboIndex);
-            }
-
-            for (int i = _inFlightPbos.Count - 1; i >= 0; --i)
-            {
-                int idx = _inFlightPbos[i];
-                var f = _pbos[idx].Fence;
-                if (f != IntPtr.Zero)
-                {
-                    var res = GL.ClientWaitSync(f, ClientWaitSyncFlags.SyncFlushCommandsBit, 0);
-                    if (res == WaitSyncStatus.AlreadySignaled || res == WaitSyncStatus.ConditionSatisfied)
-                    {
-                        GL.DeleteSync(f);
-                        _pbos[idx].Fence = IntPtr.Zero;
-                        _inFlightPbos.RemoveAt(i);
-                        _freePbos.Enqueue(idx);
-                        _freeEvent.Set();
-                    }
-                }
-            }
-
+            // HUD
             double now = _perfSw.Elapsed.TotalSeconds;
             _frameSamples.Enqueue((now, e.Time));
             while (_frameSamples.Count > 0 && _frameSamples.Peek().t < now - FpsWindowSec)
                 _frameSamples.Dequeue();
 
             double sum5 = 0.0; int n5 = 0;
-            foreach (var s in _frameSamples)
-                if (s.t >= now - FrameTimeWindowSec) { sum5 += s.dt; n5++; }
+            foreach (var s in _frameSamples) if (s.t >= now - FrameTimeWindowSec) { sum5 += s.dt; n5++; }
             double avgMs5 = n5 > 0 ? (sum5 / n5) * 1000.0 : 0.0;
 
             int n30 = _frameSamples.Count;
@@ -332,14 +187,13 @@ namespace ILGPU_Raytracing.Engine
                 _lastTitleUpdateT = now;
             }
 
+            // Blit
             GL.Viewport(0, 0, Size.X, Size.Y);
             GL.Clear(ClearBufferMask.ColorBufferBit);
-
             GL.ActiveTexture(TextureUnit.Texture0);
             GL.BindTexture(TextureTarget.Texture2D, _texture);
             GL.UseProgram(_program);
-            int texLoc = GL.GetUniformLocation(_program, "uTex");
-            GL.Uniform1(texLoc, 0);
+            GL.Uniform1(_uTexLoc, 0);
             GL.BindVertexArray(_vao);
             GL.DrawArrays(PrimitiveType.TriangleStrip, 0, 4);
             GL.BindVertexArray(0);
@@ -347,20 +201,15 @@ namespace ILGPU_Raytracing.Engine
             GL.BindTexture(TextureTarget.Texture2D, 0);
 
             SwapBuffers();
+            _frameIndex++;
         }
-
-        // ---------------- Resize / teardown ----------------
 
         protected override void OnResize(ResizeEventArgs e)
         {
             base.OnResize(e);
 
             (int newRtW, int newRtH) = ComputeInternalRT(Math.Max(1, Size.X), Math.Max(1, Size.Y));
-            if (newRtW == _rtWidth && newRtH == _rtHeight)
-                return;
-
-            StopWorker();
-            DrainAndDeleteFences();
+            if (newRtW == _rtWidth && newRtH == _rtHeight) return;
 
             _rtWidth = Math.Max(MinRtDim, newRtW);
             _rtHeight = Math.Max(MinRtDim, newRtH);
@@ -370,9 +219,7 @@ namespace ILGPU_Raytracing.Engine
 
             DisposePbos();
             CreatePbos(_rtWidth, _rtHeight);
-            EnqueueAllPbosAsFree();
-
-            StartWorker();
+            _frameIndex = 0;
         }
 
         protected override void OnClosing(CancelEventArgs e)
@@ -384,9 +231,6 @@ namespace ILGPU_Raytracing.Engine
         protected override void OnUnload()
         {
             _isClosing = true;
-
-            StopWorker();
-            DrainAndDeleteFences();
 
             try { GL.Finish(); } catch { }
 
@@ -402,8 +246,7 @@ namespace ILGPU_Raytracing.Engine
             base.OnUnload();
         }
 
-        // ---------------- Input helpers ----------------
-
+        // Input helpers (unchanged)
         protected override void OnKeyDown(KeyboardKeyEventArgs e)
         {
             base.OnKeyDown(e);
@@ -413,40 +256,42 @@ namespace ILGPU_Raytracing.Engine
                 KeyPressed?.Invoke(e.Key);
             }
         }
-        protected override void OnKeyUp(KeyboardKeyEventArgs e)
+        protected override void OnKeyUp(KeyboardKeyEventArgs e) 
         {
-            base.OnKeyUp(e);
+            base.OnKeyUp(e); 
             KeyReleased?.Invoke(e.Key);
         }
-        protected override void OnTextInput(TextInputEventArgs e)
-        {
-            base.OnTextInput(e);
-            if (e.Unicode <= char.MaxValue) CharTyped?.Invoke((char)e.Unicode);
+
+        protected override void OnTextInput(TextInputEventArgs e) 
+        { 
+            base.OnTextInput(e); 
+            if (e.Unicode <= char.MaxValue)
+                CharTyped?.Invoke((char)e.Unicode);
         }
         protected override void OnMouseMove(MouseMoveEventArgs e)
-        {
-            base.OnMouseMove(e);
-            _mousePos = e.Position;
+        { 
+            base.OnMouseMove(e); _mousePos = e.Position;
         }
-        protected override void OnMouseDown(MouseButtonEventArgs e)
-        {
+        protected override void OnMouseDown(MouseButtonEventArgs e) 
+        { 
             base.OnMouseDown(e);
             MousePressed?.Invoke(e.Button, _mousePos);
         }
-        protected override void OnMouseUp(MouseButtonEventArgs e)
-        {
+        protected override void OnMouseUp(MouseButtonEventArgs e) 
+        { 
             base.OnMouseUp(e);
             MouseReleased?.Invoke(e.Button, _mousePos);
         }
-        protected override void OnMouseWheel(MouseWheelEventArgs e)
-        {
+        protected override void OnMouseWheel(MouseWheelEventArgs e) 
+        { 
             base.OnMouseWheel(e);
             MouseWheel?.Invoke(e.Offset);
         }
-        protected override void OnFocusedChanged(FocusedChangedEventArgs e)
-        {
+        protected override void OnFocusedChanged(FocusedChangedEventArgs e) 
+        { 
             base.OnFocusedChanged(e);
-            if (!e.IsFocused && _mouseCaptured) SetMouseCapture(false);
+            if (!e.IsFocused && _mouseCaptured)
+                SetMouseCapture(false);
         }
 
         public void SetMouseCapture(bool capture)
@@ -463,29 +308,16 @@ namespace ILGPU_Raytracing.Engine
 
         public Vector2 ConsumeMouseDelta()
         {
-            Vector2 polled = MouseState.Position;
-            Vector2 d = _mouseCaptured ? (polled - _lastMousePos) : Vector2.Zero;
-            _lastMousePos = polled;
-            var accum = _mouseDeltaAccum;
+            var delta = _mouseCaptured ? _mouseDeltaAccum : Vector2.Zero;
             _mouseDeltaAccum = Vector2.Zero;
-            Vector2 total = d + accum;
-            return new Vector2(-total.X, total.Y);
+            return new Vector2(-delta.X, delta.Y);
         }
-
-        // ---------------- PBO / GL helpers ----------------
 
         private void CreatePbos(int w, int h)
         {
             _pbos = new PboSlot[PboCount];
-            using (var binding = _renderer.Accelerator.BindScoped())
-            {
-                for (int i = 0; i < PboCount; i++)
-                {
-                    _pbos[i].Buf = new CudaGlInteropIndexBuffer(w * h, _renderer.Accelerator);
-                    _pbos[i].Fence = IntPtr.Zero;
-                }
-                binding.Recover();
-            }
+            for (int i = 0; i < PboCount; i++)
+                _pbos[i].Buf = new CudaGlInteropIndexBuffer(w * h, _renderer.Accelerator);
         }
 
         private void DisposePbos()
@@ -493,46 +325,10 @@ namespace ILGPU_Raytracing.Engine
             if (_pbos == null) return;
             for (int i = 0; i < _pbos.Length; i++)
             {
-                if (_pbos[i].Fence != IntPtr.Zero)
-                {
-                    try { GL.DeleteSync(_pbos[i].Fence); } catch { }
-                    _pbos[i].Fence = IntPtr.Zero;
-                }
                 try { _pbos[i].Buf?.Dispose(); } catch { }
                 _pbos[i].Buf = null;
             }
             _pbos = Array.Empty<PboSlot>();
-            while (_freePbos.TryDequeue(out _)) { }
-            while (_readySlots.TryDequeue(out _)) { }
-            _inFlightPbos.Clear();
-        }
-
-        private void EnqueueAllPbosAsFree()
-        {
-            for (int i = 0; i < _pbos.Length; i++)
-                _freePbos.Enqueue(i);
-            _freeEvent.Set();
-        }
-
-        private void DrainAndDeleteFences()
-        {
-            for (int i = 0; i < _pbos.Length; i++)
-            {
-                var f = _pbos[i].Fence;
-                if (f != IntPtr.Zero)
-                {
-                    try
-                    {
-                        var res = GL.ClientWaitSync(f, ClientWaitSyncFlags.SyncFlushCommandsBit, 10_000_000); // 10ms
-                        if (res == WaitSyncStatus.TimeoutExpired)
-                            GL.Finish();
-                        GL.DeleteSync(f);
-                    }
-                    catch { }
-                    _pbos[i].Fence = IntPtr.Zero;
-                }
-            }
-            _inFlightPbos.Clear();
         }
 
         private static (int w, int h) ComputeInternalRT(int winW, int winH)

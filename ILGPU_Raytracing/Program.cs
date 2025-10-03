@@ -12,7 +12,7 @@ namespace ILGPU_Raytracing
     {
         static void Main(string[] args)
         {
-            using (var window = new RTWindow(800, 600, ""))
+            using (var window = new RTWindow(1280, 720, ""))
             {
                 window.Run();
             }

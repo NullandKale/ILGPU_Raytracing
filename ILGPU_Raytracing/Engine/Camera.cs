@@ -9,6 +9,13 @@ namespace ILGPU_Raytracing.Engine
         public Float3 horizontal;
         public Float3 vertical;
 
+        // NEW: cached basis + lens params used for reprojection
+        public Float3 forward;       // view forward (unit)
+        public Float3 right;         // view right (unit)
+        public Float3 up;            // view up (unit)
+        public float aspect;         // width/height
+        public float fovYRadians;    // vertical FoV in radians
+
         public static Camera CreateCamera(int width, int height, float fovDegrees)
         {
             float aspect = (float)width / (float)XMath.Max(1, height);
@@ -18,26 +25,32 @@ namespace ILGPU_Raytracing.Engine
 
             Float3 origin = new Float3(0f, 1f, 3f);
             Float3 lookAt = new Float3(0f, 0.5f, 0f);
-            Float3 up = new Float3(0f, 1f, 0f);
+            Float3 upHint = new Float3(0f, 1f, 0f);
 
-            Float3 w = Float3.Normalize(origin - lookAt);
-            Float3 u = Float3.Normalize(Float3.Cross(up, w));
-            Float3 v = Float3.Cross(w, u);
+            Float3 w = Normalize(origin - lookAt);
+            Float3 u = Normalize(Cross(upHint, w));
+            Float3 v = Cross(w, u);
 
             Float3 lowerLeft = origin - u * halfWidth - v * halfHeight - w;
             Float3 horizontal = u * (2f * halfWidth);
             Float3 vertical = v * (2f * halfHeight);
 
-            return new Camera { origin = origin, lowerLeft = lowerLeft, horizontal = horizontal, vertical = vertical };
+            Camera cam = new Camera
+            {
+                origin = origin,
+                lowerLeft = lowerLeft,
+                horizontal = horizontal,
+                vertical = vertical
+            };
+            cam.UpdateDerived(aspect, theta); // set basis/fov/aspect
+            return cam;
         }
 
+        // Mouse look: keep fov/aspect unchanged
         public void OnMouseLook(float deltaX, float deltaY, float sensitivityDegPerPixel = 0.08f)
         {
-            // Yaw from horizontal mouse motion, pitch from vertical (invert Y for typical FPS feel)
             float yawDeg = deltaX * sensitivityDegPerPixel;
             float pitchDeg = -deltaY * sensitivityDegPerPixel;
-
-            // Apply incremental rotation around world-up (yaw) and camera-right (pitch)
             RotateYawPitch(yawDeg, pitchDeg);
         }
 
@@ -45,21 +58,15 @@ namespace ILGPU_Raytracing.Engine
             bool keyW, bool keyA, bool keyS, bool keyD, bool keyQ, bool keyE,
             float dtSeconds, float moveSpeed = 3.0f)
         {
-            // Derive camera basis from current frustum
             Float3 forward = Normalize((lowerLeft + horizontal * 0.5f + vertical * 0.5f) - origin);
             Float3 up = Normalize(vertical);
             Float3 right = Normalize(Cross(forward, up));
             Float3 worldUp = new Float3(0f, 1f, 0f);
 
-            // Project forward onto the horizontal plane so W/S don't climb/descend with pitch
             Float3 fwdHoriz = forward - worldUp * Dot(forward, worldUp);
             float fwdLen2 = Dot(fwdHoriz, fwdHoriz);
-            if (fwdLen2 > 1e-12f)
-                fwdHoriz = fwdHoriz * XMath.Rsqrt(fwdLen2);
-            else
-                fwdHoriz = right; // degenerate (looking straight up/down): fall back to strafing axis
+            fwdHoriz = (fwdLen2 > 1e-12f) ? fwdHoriz * XMath.Rsqrt(fwdLen2) : right;
 
-            // Build movement vector: A/D = strafe, Q/E = down/up, W/S = forward/back (horizontal only)
             Float3 move = default;
             if (keyA) move -= right;
             if (keyD) move += right;
@@ -68,7 +75,6 @@ namespace ILGPU_Raytracing.Engine
             if (keyW) move += fwdHoriz;
             if (keyS) move -= fwdHoriz;
 
-            // Normalize so diagonals aren't faster, then translate camera
             float m2 = Dot(move, move);
             if (m2 > 1e-12f)
             {
@@ -77,13 +83,18 @@ namespace ILGPU_Raytracing.Engine
             }
         }
 
-
         public Camera(Float3 origin, Float3 lowerLeft, Float3 horizontal, Float3 vertical)
         {
             this.origin = origin;
             this.lowerLeft = lowerLeft;
             this.horizontal = horizontal;
             this.vertical = vertical;
+            // Fill derived with defaults (caller should call UpdateDerived)
+            forward = new Float3(0, 0, -1);
+            right = new Float3(1, 0, 0);
+            up = new Float3(0, 1, 0);
+            aspect = 1f;
+            fovYRadians = XMath.PI / 3f;
         }
 
         public Camera(Float3 origin, Float3 lookAt, Float3 up, float vfovDegrees, float aspect, float focusDist = 1f)
@@ -99,12 +110,19 @@ namespace ILGPU_Raytracing.Engine
             this.horizontal = u * (2f * halfWidth);
             this.vertical = v * (2f * halfHeight);
             this.lowerLeft = origin - u * halfWidth - v * halfHeight + forward * focusDist;
+
+            this.forward = Normalize((lowerLeft + horizontal * 0.5f + vertical * 0.5f) - origin);
+            this.right = Normalize(Cross(this.forward, v));
+            this.up = Normalize(v);
+            this.aspect = aspect;
+            this.fovYRadians = theta;
         }
 
         public void Translate(Float3 delta)
         {
-            origin = origin + delta;
-            lowerLeft = lowerLeft + delta;
+            origin += delta;
+            lowerLeft += delta;
+            UpdateDerived(aspect, fovYRadians);
         }
 
         public void SetFov(float vfovDegrees, float aspect)
@@ -122,6 +140,8 @@ namespace ILGPU_Raytracing.Engine
             horizontal = u * (2f * halfWidth);
             vertical = v * (2f * halfHeight);
             lowerLeft = origin - u * halfWidth - v * halfHeight + forward * focusDist;
+
+            UpdateDerived(aspect, theta);
         }
 
         public void RotateYawPitch(float yawDegrees, float pitchDegrees)
@@ -131,48 +151,54 @@ namespace ILGPU_Raytracing.Engine
             float focusDist = Length((lowerLeft + horizontal * 0.5f + vertical * 0.5f) - origin);
 
             Float3 forward = Normalize((lowerLeft + horizontal * 0.5f + vertical * 0.5f) - origin);
-            Float3 up = Normalize(vertical);
-            Float3 right = Normalize(Cross(forward, up));
-
+            Float3 upVec = Normalize(vertical);
+            Float3 rightVec = Normalize(Cross(forward, upVec));
             Float3 worldUp = new Float3(0f, 1f, 0f);
 
             float yaw = DegToRad(yawDegrees);
             float pitch = DegToRad(pitchDegrees);
 
             if (Abs(Dot(forward, worldUp)) > 0.999f)
-            {
-                worldUp = Normalize(Cross(right, forward));
-            }
+                worldUp = Normalize(Cross(rightVec, forward));
 
             forward = RotateAroundAxis(forward, worldUp, yaw);
-            up = RotateAroundAxis(up, worldUp, yaw);
-            right = Normalize(Cross(forward, up));
-            up = Normalize(Cross(right, forward));
+            upVec = RotateAroundAxis(upVec, worldUp, yaw);
+            rightVec = Normalize(Cross(forward, upVec));
+            upVec = Normalize(Cross(rightVec, forward));
 
-            forward = RotateAroundAxis(forward, right, pitch);
-            up = Normalize(Cross(right, forward));
+            forward = RotateAroundAxis(forward, rightVec, pitch);
+            upVec = Normalize(Cross(rightVec, forward));
 
-            OrthoBasis(forward, up, out Float3 u, out Float3 v, out Float3 w);
+            OrthoBasis(forward, upVec, out Float3 u, out Float3 v, out Float3 w);
 
             horizontal = u * (2f * halfWidth);
             vertical = v * (2f * halfHeight);
             lowerLeft = origin - u * halfWidth - v * halfHeight + forward * focusDist;
+
+            // keep the same fov/aspect
+            UpdateDerived(aspect, fovYRadians);
+        }
+
+        // --- helpers ---
+
+        private void UpdateDerived(float aspectIn, float fovYRadIn)
+        {
+            forward = Normalize((lowerLeft + horizontal * 0.5f + vertical * 0.5f) - origin);
+            up = Normalize(vertical);
+            right = Normalize(Cross(forward, up));
+            aspect = aspectIn;
+            fovYRadians = fovYRadIn;
         }
 
         private static void OrthoBasis(Float3 forward, Float3 upHint, out Float3 u, out Float3 v, out Float3 w)
         {
             Float3 f = Normalize(forward);
             Float3 up = upHint;
-
             if (Abs(Dot(f, up)) > 0.999f)
             {
                 up = new Float3(0f, 1f, 0f);
-                if (Abs(Dot(f, up)) > 0.999f)
-                {
-                    up = new Float3(1f, 0f, 0f);
-                }
+                if (Abs(Dot(f, up)) > 0.999f) up = new Float3(1f, 0f, 0f);
             }
-
             u = Normalize(Cross(f, up));
             v = Normalize(Cross(u, f));
             w = new Float3(-f.X, -f.Y, -f.Z);
@@ -189,36 +215,17 @@ namespace ILGPU_Raytracing.Engine
             return term1 + term2 + term3;
         }
 
-        private static float DegToRad(float d)
-        {
-            return d * (XMath.PI / 180f);
-        }
-
-        private static float Length(Float3 v)
-        {
-            return XMath.Sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z);
-        }
-
+        private static float DegToRad(float d) => d * (XMath.PI / 180f);
+        private static float Length(Float3 v) => XMath.Sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z);
         private static Float3 Normalize(Float3 v)
         {
             float len2 = v.X * v.X + v.Y * v.Y + v.Z * v.Z;
             float inv = XMath.Rsqrt(XMath.Max(1e-20f, len2));
             return new Float3(v.X * inv, v.Y * inv, v.Z * inv);
         }
-
-        private static Float3 Cross(Float3 a, Float3 b)
-        {
-            return new Float3(a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X);
-        }
-
-        private static float Dot(Float3 a, Float3 b)
-        {
-            return a.X * b.X + a.Y * b.Y + a.Z * b.Z;
-        }
-
-        private static float Abs(float x)
-        {
-            return x < 0f ? -x : x;
-        }
+        private static Float3 Cross(Float3 a, Float3 b) =>
+            new Float3(a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X);
+        private static float Dot(Float3 a, Float3 b) => a.X * b.X + a.Y * b.Y + a.Z * b.Z;
+        private static float Abs(float x) => x < 0f ? -x : x;
     }
 }

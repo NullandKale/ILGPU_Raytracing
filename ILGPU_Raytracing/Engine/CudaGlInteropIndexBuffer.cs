@@ -1,15 +1,14 @@
 ﻿using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
-using OpenTK.Mathematics;
+using System;
 using System.Diagnostics;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL4;
 
 namespace ILGPU_Raytracing.Engine
 {
-    public enum CudaGraphicsMapFlags
+    public enum CudaGraphicsMapFlags : uint
     {
         None = 0,
         ReadOnly = 1,
@@ -19,208 +18,177 @@ namespace ILGPU_Raytracing.Engine
     public static class CudaGlInterop
     {
         [DllImport("nvcuda", EntryPoint = "cuGraphicsGLRegisterBuffer")]
-        public static extern CudaError RegisterBuffer(
-            out IntPtr resource,
-            int buffer,
-            uint flags);
+        public static extern CudaError RegisterBuffer(out IntPtr resource, int buffer, uint flags);
+
+        [DllImport("nvcuda", EntryPoint = "cuGraphicsUnregisterResource")]
+        public static extern CudaError UnregisterResource(IntPtr resource);
 
         [DllImport("nvcuda", EntryPoint = "cuGraphicsMapResources")]
-        public static extern CudaError MapResources(
-            int count,
-            IntPtr resources,
-            IntPtr stream);
+        public static extern CudaError MapResources(int count, IntPtr resources, IntPtr stream);
 
         [DllImport("nvcuda", EntryPoint = "cuGraphicsUnmapResources")]
-        public static extern CudaError UnmapResources(
-            int count,
-            IntPtr resources,
-            IntPtr stream);
+        public static extern CudaError UnmapResources(int count, IntPtr resources, IntPtr stream);
 
         [DllImport("nvcuda", EntryPoint = "cuGraphicsResourceGetMappedPointer_v2")]
-        public static extern CudaError GetMappedPointer(
-            out IntPtr devicePtr,
-            out int size,
-            IntPtr resource);
+        public static extern CudaError GetMappedPointer(out IntPtr devicePtr, out int size, IntPtr resource);
     }
 
+    // GL PixelUnpackBuffer registered with CUDA; exposes a typed ArrayView<int> while mapped
     public sealed class CudaGlInteropIndexBuffer : MemoryBuffer
     {
-        private IntPtr cudaResource;
+        private IntPtr _cudaResource;
         public int glBufferHandle;
-        private State state;
-        private int _elementCount;
+        private State _state;
+        private readonly int _elementCount;
 
         public CudaGlInteropIndexBuffer(int elementCount, CudaAccelerator accelerator)
             : base(accelerator, elementCount * sizeof(int), sizeof(int))
         {
             _elementCount = elementCount;
 
-            // Create the OpenGL buffer (index buffer in this case)
+            // Create GL PixelUnpackBuffer (used by glTexSubImage2D uploads)
             glBufferHandle = GL.GenBuffer();
-            GL.BindBuffer(BufferTarget.ElementArrayBuffer, glBufferHandle);
-            GL.BufferData(BufferTarget.ElementArrayBuffer, elementCount * sizeof(int), IntPtr.Zero, BufferUsageHint.DynamicDraw);
-            GL.BindBuffer(BufferTarget.ElementArrayBuffer, 0);
+            GL.BindBuffer(BufferTarget.PixelUnpackBuffer, glBufferHandle);
+            GL.BufferData(BufferTarget.PixelUnpackBuffer, elementCount * sizeof(int), IntPtr.Zero, BufferUsageHint.StreamDraw);
+            GL.BindBuffer(BufferTarget.PixelUnpackBuffer, 0);
 
-            // Register the OpenGL buffer with CUDA
-            CudaException.ThrowIfFailed(CudaGlInterop.RegisterBuffer(
-                out cudaResource,
-                glBufferHandle,
-                (int)CudaGraphicsMapFlags.None)); // None => CUDA can both read and write the buffer
+            // Register with CUDA (WriteDiscard is fine; CUDA fully overwrites it each frame)
+            CudaException.ThrowIfFailed(
+                CudaGlInterop.RegisterBuffer(out _cudaResource, glBufferHandle, (uint)CudaGraphicsMapFlags.WriteDiscard));
 
-            state = State.AvailableForGl;
+            _state = State.AvailableForGl;
         }
 
-        public void MapCuda(CudaStream stream)
+        public unsafe void MapCuda(CudaStream stream)
         {
-            if (state == State.AvailableForGl)
-            {
-                unsafe
-                {
-                    fixed (IntPtr* pResources = &cudaResource)
-                    {
-                        CudaException.ThrowIfFailed(CudaGlInterop.MapResources(
-                            1, new IntPtr(pResources), stream.StreamPtr));
-                    }
-                }
+            if (_state != State.AvailableForGl) return;
 
-                state = State.MappedToCuda;
-            }
+            IntPtr* pRes = stackalloc IntPtr[1];
+            pRes[0] = _cudaResource;
+
+            CudaException.ThrowIfFailed(
+                CudaGlInterop.MapResources(1, new IntPtr(pRes), stream?.StreamPtr ?? IntPtr.Zero));
+
+            _state = State.MappedToCuda;
         }
 
         public ArrayView<int> GetCudaArrayView()
         {
-            if (state != State.MappedToCuda)
-                throw new InvalidOperationException("Buffer must be mapped to CUDA before accessing.");
+            if (_state != State.MappedToCuda)
+                throw new InvalidOperationException("PBO must be mapped to CUDA before accessing.");
 
-            CudaException.ThrowIfFailed(CudaGlInterop.GetMappedPointer(
-                out var devicePtr, out var bufLen, cudaResource));
-            Trace.Assert(bufLen == _elementCount * sizeof(int));
-            NativePtr = devicePtr;
+            CudaException.ThrowIfFailed(
+                CudaGlInterop.GetMappedPointer(out var devicePtr, out var byteSize, _cudaResource));
 
-            var view = AsArrayView<int>(0, _elementCount);
-            return view;
+            Trace.Assert(byteSize == _elementCount * sizeof(int));
+            NativePtr = devicePtr; // tell ILGPU where the memory lives
+
+            return AsArrayView<int>(0, _elementCount);
         }
 
-        public void UnmapCuda(CudaStream stream)
+        public unsafe void UnmapCuda(CudaStream stream)
         {
-            if (state == State.MappedToCuda)
-            {
-                unsafe
-                {
-                    fixed (IntPtr* pResources = &cudaResource)
-                    {
-                        CudaException.ThrowIfFailed(CudaGlInterop.UnmapResources(
-                            1, new IntPtr(pResources), stream.StreamPtr));
-                    }
-                }
+            if (_state != State.MappedToCuda) return;
 
-                NativePtr = IntPtr.Zero;
-                state = State.AvailableForGl;
-            }
+            IntPtr* pRes = stackalloc IntPtr[1];
+            pRes[0] = _cudaResource;
+
+            CudaException.ThrowIfFailed(
+                CudaGlInterop.UnmapResources(1, new IntPtr(pRes), stream?.StreamPtr ?? IntPtr.Zero));
+
+            NativePtr = IntPtr.Zero;
+            _state = State.AvailableForGl;
         }
 
-        public static void CudaMemSet<T>(CudaStream stream, byte value, in ArrayView<T> targetView)
-            where T : unmanaged
+        public bool IsValid() => glBufferHandle != 0 && GL.IsBuffer(glBufferHandle);
+
+        // ---- MemoryBuffer overrides (required) ----
+        // We only allow these while the buffer is mapped to CUDA. No BindScoped() used (single stream).
+        protected override void MemSet(AcceleratorStream stream, byte value, in ArrayView<byte> targetView)
         {
-            if (stream is null)
-                throw new ArgumentNullException(nameof(stream));
-
-            if (targetView.GetAcceleratorType() != AcceleratorType.Cuda) throw new NotSupportedException();
-
-            var binding = stream.Accelerator.BindScoped();
+            if (_state != State.MappedToCuda) throw new InvalidOperationException("PBO must be mapped before MemSet.");
+            if (stream is not CudaStream cs) throw new NotSupportedException("Only CUDA is supported.");
 
             CudaException.ThrowIfFailed(
                 CudaAPI.CurrentAPI.Memset(
                     targetView.LoadEffectiveAddressAsPtr(),
                     value,
                     new IntPtr(targetView.LengthInBytes),
-                    stream));
-
-            binding.Recover();
+                    cs));
         }
 
-        public static void CudaCopy<T>(CudaStream stream, in ArrayView<T> sourceView, in ArrayView<T> targetView)
-            where T : unmanaged
+        protected override void CopyTo(AcceleratorStream stream, in ArrayView<byte> sourceView, in ArrayView<byte> targetView)
         {
-            if (stream is null)
-                throw new ArgumentNullException(nameof(stream));
+            // Copy from this buffer -> targetView (device or host). Must be mapped.
+            if (_state != State.MappedToCuda) throw new InvalidOperationException("PBO must be mapped before CopyTo.");
+            if (stream is not CudaStream cs) throw new NotSupportedException("Only CUDA is supported.");
 
-            using var binding = stream.Accelerator.BindScoped();
+            var srcPtr = sourceView.LoadEffectiveAddressAsPtr();
+            var dstPtr = targetView.LoadEffectiveAddressAsPtr();
 
-            var sourceType = sourceView.GetAcceleratorType();
-            var targetType = targetView.GetAcceleratorType();
-
-            if (sourceType == AcceleratorType.OpenCL ||
-                targetType == AcceleratorType.OpenCL)
-                throw new NotSupportedException();
-
-            var sourceAddress = sourceView.LoadEffectiveAddressAsPtr();
-            var targetAddress = targetView.LoadEffectiveAddressAsPtr();
-
-            var length = new IntPtr(targetView.LengthInBytes);
-
-            // a) Copy from CPU to GPU
-            // b) Copy from GPU to CPU
-            // c) Copy from GPU to GPU
             CudaException.ThrowIfFailed(
                 CudaAPI.CurrentAPI.MemcpyAsync(
-                    targetAddress,
-                    sourceAddress,
-                    length,
-                    stream));
+                    dstPtr,
+                    srcPtr,
+                    new IntPtr(targetView.LengthInBytes),
+                    cs));
         }
 
-
-        protected override void MemSet(
-            AcceleratorStream stream,
-            byte value,
-            in ArrayView<byte> targetView)
+        protected override void CopyFrom(AcceleratorStream stream, in ArrayView<byte> sourceView, in ArrayView<byte> targetView)
         {
-            CudaMemSet(stream as CudaStream, value, targetView);
+            // Copy from sourceView -> this buffer. Must be mapped.
+            if (_state != State.MappedToCuda) throw new InvalidOperationException("PBO must be mapped before CopyFrom.");
+            if (stream is not CudaStream cs) throw new NotSupportedException("Only CUDA is supported.");
+
+            var srcPtr = sourceView.LoadEffectiveAddressAsPtr();
+            var dstPtr = targetView.LoadEffectiveAddressAsPtr();
+
+            CudaException.ThrowIfFailed(
+                CudaAPI.CurrentAPI.MemcpyAsync(
+                    dstPtr,
+                    srcPtr,
+                    new IntPtr(targetView.LengthInBytes),
+                    cs));
         }
 
-        protected override void CopyFrom(
-            AcceleratorStream stream,
-            in ArrayView<byte> sourceView,
-            in ArrayView<byte> targetView)
+        protected override unsafe void DisposeAcceleratorObject(bool disposing)
         {
-            CudaCopy(stream as CudaStream, sourceView, targetView);
-        }
+            // Ensure unmapped and unregistered from CUDA
+            try
+            {
+                if (_state == State.MappedToCuda)
+                {
+                    IntPtr* pRes = stackalloc IntPtr[1];
+                    pRes[0] = _cudaResource;
+                    CudaGlInterop.UnmapResources(1, new IntPtr(pRes), IntPtr.Zero);
+                    _state = State.AvailableForGl;
+                }
+            }
+            catch { /* best effort */ }
 
-        protected override void CopyTo(
-            AcceleratorStream stream,
-            in ArrayView<byte> sourceView,
-            in ArrayView<byte> targetView)
-        {
-            CudaCopy(stream as CudaStream, sourceView, targetView);
-        }
+            try
+            {
+                if (_cudaResource != IntPtr.Zero)
+                {
+                    CudaGlInterop.UnregisterResource(_cudaResource);
+                    _cudaResource = IntPtr.Zero;
+                }
+            }
+            catch { /* best effort */ }
 
-        public bool IsValid()
-        {
-            return glBufferHandle != 0 && GL.IsBuffer(glBufferHandle);
-        }
-
-        protected override void DisposeAcceleratorObject(bool disposing)
-        {
             if (disposing)
             {
-                // Dispose of the OpenGL buffer
                 if (glBufferHandle != 0)
                 {
-                    GL.BindBuffer(BufferTarget.ElementArrayBuffer, 0);
+                    GL.BindBuffer(BufferTarget.PixelUnpackBuffer, 0);
                     GL.DeleteBuffer(glBufferHandle);
-                    glBufferHandle = 0; // Ensure the handle is reset to prevent reuse
+                    glBufferHandle = 0;
                 }
             }
 
-            // disposes the cuda memory
             base.Dispose();
         }
 
-        private enum State
-        {
-            AvailableForGl,
-            MappedToCuda
-        }
+        private enum State { AvailableForGl, MappedToCuda }
     }
 }
